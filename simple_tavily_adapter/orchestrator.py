@@ -374,9 +374,13 @@ class Orchestrator:
     def _extract_agent_response(logs: str) -> str:
         """Strip Hermes boilerplate from stdout, keep only the agent's reply.
 
-        Without --quiet Hermes emits a banner, a "Query:" echo, tool-call
-        previews, a box-drawn response envelope, and an exit summary. We drop
-        all of that and keep only the prose.
+        Hermes (without --quiet) echoes the user's query along with the
+        orchestrator-appended MANDATORY_SUFFIX, then tool previews, then the
+        final response in a box, then an exit summary. We:
+          1. Drop per-line banners / preview / summary lines.
+          2. Drop the whole "mandatory-suffix echo" block that starts at
+             "IMPORTANT — Role + output contract" and ends at the separator
+             line before the agent actually starts talking.
         """
         drop_patterns = (
             "Syncing bundled skills",
@@ -390,6 +394,9 @@ class Orchestrator:
             "Tool call",                             # "Tool call: searcharvester-search ..."
             "Running tool",
             "tool:",                                 # "tool: bash ..."
+            "preparing exec",
+            "preparing terminal",
+            "preparing searcharvester",
         )
         drop_prefixes = (
             "Done:",                 # "Done: 0 new, 0 updated, 72 unchanged ..."
@@ -402,15 +409,34 @@ class Orchestrator:
             "╭", "╰", "╯", "╮",
             "+",                    # some box variants use ASCII +
             "━", "┃", "┏", "┓", "┗", "┛",
+            "  ┊",                  # Hermes tool-preview indent marker
         )
+
         kept: list[str] = []
+        # Stateful skip for the MANDATORY_SUFFIX block — once we see its
+        # sentinel, skip every line up to and including the "Both steps are
+        # non-negotiable." footer.
+        skipping_suffix = False
         for line in logs.splitlines():
             stripped = line.strip()
+
+            if not skipping_suffix and (
+                "IMPORTANT — Role + output contract" in line
+                or "IMPORTANT — Output contract" in line
+            ):
+                skipping_suffix = True
+                continue
+            if skipping_suffix:
+                if "non-negotiable" in stripped:
+                    skipping_suffix = False
+                continue
+
             if any(p in line for p in drop_patterns):
                 continue
             if any(stripped.startswith(p) for p in drop_prefixes):
                 continue
             kept.append(line)
+
         text = "\n".join(kept).strip()
         # Collapse >2 blank lines in a row
         while "\n\n\n" in text:
