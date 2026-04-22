@@ -7,6 +7,9 @@ import {
   CheckCircle2,
   Terminal,
   Save,
+  Cpu,
+  Container as ContainerIcon,
+  Info,
 } from "lucide-react";
 
 interface Props {
@@ -29,19 +32,106 @@ export default function LogTimeline({ rawLog }: Props) {
     );
   }
 
+  // Count agent tool calls so we can show a "single-threaded, no sub-agents"
+  // note that's accurate (and reminds the user what they're looking at).
+  const toolCalls = events.filter((e) =>
+    ["search", "extract", "write_report", "other_tool"].includes(e.kind)
+  ).length;
+
   return (
-    <ol className="space-y-1.5 text-sm">
-      {events.map((ev, i) => (
-        <li key={i} className="flex items-start gap-2.5">
-          {renderEvent(ev)}
-        </li>
-      ))}
-    </ol>
+    <div className="space-y-2">
+      {toolCalls > 0 && (
+        <div className="flex items-start gap-2 px-2.5 py-1.5 rounded-md bg-base-800/60 border border-base-700 text-xs text-slate-400">
+          <Info size={12} className="shrink-0 mt-0.5 text-slate-500" />
+          <div className="leading-relaxed">
+            Single agent, sequential tool calls ({toolCalls} so far).{" "}
+            <span className="text-slate-500">
+              Parallel sub-agents via Hermes' <code className="font-mono">delegate_task</code> — not yet.
+            </span>
+          </div>
+        </div>
+      )}
+
+      <ol className="space-y-1.5 text-sm">
+        {events.map((ev, i) => {
+          // Visual separator before first agent tool call after orchestrator events
+          const prev = i > 0 ? events[i - 1] : null;
+          const prevIsOrch =
+            prev &&
+            (prev.kind === "orch_spawn" ||
+              prev.kind === "agent_init" ||
+              prev.kind === "orch_collect");
+          const curIsAgentWork =
+            ["search", "extract", "write_report", "other_tool"].includes(ev.kind);
+          const showSeparator = prev && prevIsOrch && curIsAgentWork;
+          return (
+            <div key={i}>
+              {showSeparator && (
+                <div className="my-2 text-xs text-slate-600 uppercase tracking-widest flex items-center gap-2">
+                  <span className="h-px flex-1 bg-base-700" />
+                  <span>agent turns</span>
+                  <span className="h-px flex-1 bg-base-700" />
+                </div>
+              )}
+              <li className="flex items-start gap-2.5">
+                {renderEvent(ev)}
+              </li>
+            </div>
+          );
+        })}
+      </ol>
+    </div>
   );
 }
 
 function renderEvent(ev: LogEvent) {
   switch (ev.kind) {
+    case "orch_spawn":
+      return (
+        <>
+          <div className="shrink-0 mt-0.5 text-fuchsia-400">
+            <ContainerIcon size={14} />
+          </div>
+          <div className="flex-1 min-w-0">
+            <span className="text-fuchsia-400 font-semibold uppercase text-xs mr-2 tracking-wider">
+              orchestrator
+            </span>
+            <span className="text-slate-300">{ev.text}</span>
+          </div>
+        </>
+      );
+    case "agent_init":
+      return (
+        <>
+          <div className="shrink-0 mt-0.5 text-amber-300">
+            <Cpu size={14} />
+          </div>
+          <div className="flex-1 min-w-0">
+            <span className="text-amber-300 font-semibold uppercase text-xs mr-2 tracking-wider">
+              agent
+            </span>
+            <span className="text-slate-300">{ev.text}</span>
+          </div>
+        </>
+      );
+    case "orch_collect":
+      return (
+        <>
+          <div className="shrink-0 mt-0.5 text-fuchsia-400">
+            <ContainerIcon size={14} />
+          </div>
+          <div className="flex-1 min-w-0">
+            <span className="text-fuchsia-400 font-semibold uppercase text-xs mr-2 tracking-wider">
+              orchestrator
+            </span>
+            <span className="text-slate-300">{ev.text}</span>
+          </div>
+          <div className="shrink-0 flex items-center gap-1 text-xs">
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.6)]" />
+            <span className="text-emerald-400 font-semibold uppercase tracking-wider">done</span>
+          </div>
+        </>
+      );
     case "search":
       return (
         <>

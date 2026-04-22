@@ -17,6 +17,8 @@
  */
 
 export type LogEvent =
+  | { kind: "orch_spawn"; text: string }        // orchestrator spawned the agent container
+  | { kind: "agent_init"; text: string }        // Hermes runtime booting
   | { kind: "search"; query: string; maxResults?: number; duration?: string; error?: boolean }
   | { kind: "extract"; url: string; size?: string; duration?: string; error?: boolean }
   | { kind: "write_report"; duration?: string }
@@ -24,6 +26,7 @@ export type LogEvent =
   | { kind: "api_retry"; attempt: number; of: number; error: string }
   | { kind: "waiting_retry"; seconds: number }
   | { kind: "report_saved" }
+  | { kind: "orch_collect"; text: string }      // orchestrator read report and cleaned up
   | { kind: "note"; text: string };
 
 const SEARCH_RE =
@@ -43,6 +46,24 @@ export function parseHermesLog(raw: string): LogEvent[] {
   if (!raw) return [];
   const out: LogEvent[] = [];
   const lines = raw.split("\n");
+
+  // Infer: if the Hermes banner is in the log, the orchestrator has already
+  // spawned the container. Emit a synthetic orchestrator-event at the top so
+  // the UI reflects the full lifecycle, not just the agent turns.
+  const hasBanner =
+    raw.includes("Syncing bundled skills") || raw.includes("Hermes Agent v");
+  if (hasBanner) {
+    out.push({
+      kind: "orch_spawn",
+      text: "orchestrator → spawned ephemeral hermes-agent container",
+    });
+  }
+  if (raw.includes("Initializing agent")) {
+    out.push({
+      kind: "agent_init",
+      text: "agent (gpt-oss-120b) initialised, loading skills",
+    });
+  }
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
@@ -112,8 +133,21 @@ export function parseHermesLog(raw: string): LogEvent[] {
 
     if (line.startsWith("REPORT_SAVED:")) {
       out.push({ kind: "report_saved" });
+      // If Hermes has already printed its exit summary after this, the
+      // orchestrator has picked up the report and is cleaning up.
       continue;
     }
   }
+
+  // Exit summary line ("Session: ...") marks container exit → orchestrator
+  // is collecting report + removing the container.
+  if (raw.includes("Session:") && raw.match(/Duration:\s+\d/)) {
+    out.push({
+      kind: "orch_collect",
+      text:
+        "orchestrator ← read /workspace/report.md · container --rm · done",
+    });
+  }
+
   return out;
 }
