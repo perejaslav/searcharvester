@@ -233,9 +233,13 @@ class Orchestrator:
             "SEARCHARVESTER_URL": self._adapter_url,
         }
         wrapped_query = query + MANDATORY_SUFFIX
+        # NOT using -Q here on purpose: quiet mode silences tool previews and
+        # the per-turn spinner, so the UI debug pane has nothing to show while
+        # the agent works. The extra banner / exit-summary lines are filtered
+        # in _extract_agent_response.
         return {
             "command": [
-                "chat", "-Q", "-q", wrapped_query,
+                "chat", "-q", wrapped_query,
                 "-s", ",".join(self._skills),
                 "-t", "terminal",
                 "--yolo",
@@ -368,11 +372,24 @@ class Orchestrator:
 
     @staticmethod
     def _extract_agent_response(logs: str) -> str:
-        """Strip Hermes boilerplate from stdout, keep only the agent's reply."""
+        """Strip Hermes boilerplate from stdout, keep only the agent's reply.
+
+        Without --quiet Hermes emits a banner, a "Query:" echo, tool-call
+        previews, a box-drawn response envelope, and an exit summary. We drop
+        all of that and keep only the prose.
+        """
         drop_patterns = (
             "Syncing bundled skills",
             "skills_sync.py",
             "Token cost", "Tokens:", "Cost:", "cost/tokens",
+            "Hermes Agent v",                        # banner
+            "Query:",                                # echoed user query
+            "Initializing agent",
+            "Enabled toolsets",
+            "Loaded skills",
+            "Tool call",                             # "Tool call: searcharvester-search ..."
+            "Running tool",
+            "tool:",                                 # "tool: bash ..."
         )
         drop_prefixes = (
             "Done:",                 # "Done: 0 new, 0 updated, 72 unchanged ..."
@@ -380,6 +397,11 @@ class Orchestrator:
             "Resume this session with",
             "Session:", "Duration:", "Messages:",
             "⚠",                    # various warnings Hermes emits
+            "─",                    # box-drawing characters used around the answer
+            "│",
+            "╭", "╰", "╯", "╮",
+            "+",                    # some box variants use ASCII +
+            "━", "┃", "┏", "┓", "┗", "┛",
         )
         kept: list[str] = []
         for line in logs.splitlines():
