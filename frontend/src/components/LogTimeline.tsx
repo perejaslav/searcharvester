@@ -159,15 +159,33 @@ function renderEvent(ev: LogEvent) {
 }
 
 function renderDuration(duration: string | undefined, error?: boolean) {
-  if (!duration && !error) return null;
+  if (!duration && !error) {
+    // Even with no duration we want to show a status pill.
+    return (
+      <div className="shrink-0 flex items-center gap-1.5 text-xs">
+        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.6)]" />
+        <span className="text-emerald-400 font-semibold uppercase tracking-wider">ok</span>
+      </div>
+    );
+  }
+  if (error) {
+    return (
+      <div className="shrink-0 flex items-center gap-2 text-xs font-mono">
+        <span className="text-slate-500">{duration}</span>
+        <span className="flex items-center gap-1 text-red-400">
+          <span className="w-1.5 h-1.5 rounded-full bg-red-500 shadow-[0_0_6px_rgba(239,68,68,0.6)]" />
+          <span className="font-semibold uppercase tracking-wider">fail</span>
+        </span>
+      </div>
+    );
+  }
   return (
-    <div
-      className={`shrink-0 text-xs font-mono ${
-        error ? "text-red-400" : "text-slate-500"
-      }`}
-    >
-      {duration}
-      {error && " [err]"}
+    <div className="shrink-0 flex items-center gap-2 text-xs font-mono">
+      <span className="text-slate-500">{duration}</span>
+      <span className="flex items-center gap-1 text-emerald-400">
+        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.6)]" />
+        <span className="font-semibold uppercase tracking-wider">ok</span>
+      </span>
     </div>
   );
 }

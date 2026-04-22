@@ -52,6 +52,22 @@ Do **not** use this skill for:
 that is not backed by a concrete source you have actually read. If you can't
 find a source, say "no source found" — do not hallucinate.
 
+## Depth budget
+
+**Aim for 20–30 distinct sources actually extracted**, not just found in search
+results. Depth beats breadth:
+
+- **Minimum:** 15 successful `searcharvester-extract` calls across 4+ domains
+  before you're allowed to write the report.
+- **Target:** 20–30 successful extracts covering 6+ domains, 3–7 sub-questions.
+- **Only stop earlier** if the question is genuinely narrow (e.g. "what is X
+  in one sentence") — and even then, at least 3 extracts for cross-reference.
+
+Plan search queries to maximise coverage: vary phrasings, include the target's
+own URLs (personal site, GitHub, company page), try English and the user's
+language, try `site:wikipedia.org`, `site:github.com`, news / press queries.
+Each sub-question deserves **multiple** search calls with different angles.
+
 ## Procedure
 
 Follow the five phases in order. Do not skip phases. Do not mix them.
@@ -100,15 +116,17 @@ For each sub-question:
    `--max-results 5`. If results look weak, retry with different engines
    (`--engines duckduckgo,brave`) or categories (`--categories news` for
    recency-sensitive questions).
-2. **Pick 1–2 authoritative sources**: prefer primary (official docs, github
-   repo, author's blog, benchmark authors) over secondary (aggregator sites,
-   news summaries of other articles).
+2. **Pick 3–5 candidate sources** per sub-question (not 1–2): aim for
+   primary sources (official docs, github repo, author's blog, benchmark
+   authors) and corroborating secondary sources. More sources = stronger
+   report. Don't stop at the first matching result.
 3. **Extract**: call `searcharvester-extract --size m` on each chosen URL.
    - If the answer is in the first 10 000 chars — done.
    - If the document is long and relevant — use `--size f` and paginate via
      `--id --page`.
-   - If extraction fails (422/502) — pick another source from the search
-     results.
+   - If extraction fails (422/502) — **immediately pick another URL** from
+     your search results and extract it. Failed extracts don't count toward
+     the depth budget.
 4. **Note** what you learned, with the URL, **into `/workspace/notes.md`**:
 
 ```markdown

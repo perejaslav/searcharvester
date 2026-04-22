@@ -98,7 +98,9 @@ services:
       - ADAPTER_URL_FOR_HERMES=http://host.docker.internal:8000
       # Research job timeout (seconds).
       - RESEARCH_TIMEOUT_SEC=900
-      - RESEARCH_MAX_TURNS=30
+      # Raised from 30 to 60 so the agent has budget for 20-30 source extracts
+      # required by the searcharvester-deep-research skill.
+      - RESEARCH_MAX_TURNS=60
       # LLM creds: pass-through — set these in the shell or an .env file.
       # Supports OPENAI_API_KEY+OPENAI_BASE_URL, OPENROUTER_API_KEY, etc.
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
