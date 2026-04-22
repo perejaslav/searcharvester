@@ -120,6 +120,27 @@ services:
         max-size: "1m"
         max-file: "1"
 
+  # React + Tailwind + Vite UI over the /research API.
+  # Built as static files and served with `serve` on :9762.
+  # For local dev iteration you can also run `npm run dev` from ./frontend.
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        # Same-machine default; override in env for reverse-proxy deploys.
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+    container_name: searcharvester-frontend
+    restart: unless-stopped
+    ports:
+      - "9762:9762"
+    depends_on:
+      - tavily-adapter
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "1m"
+        max-file: "1"
+
 networks:
   searxng:
 

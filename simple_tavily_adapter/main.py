@@ -13,18 +13,22 @@ Endpoints:
 """
 import asyncio
 import hashlib
+import json
 import logging
 import math
 import os
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path as FSPath
 from typing import Any, Literal
 
 import aiohttp
 import trafilatura
 from fastapi import FastAPI, HTTPException, Path
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, constr
+from sse_starlette.sse import EventSourceResponse
 
 from tavily_client import TavilyResponse, TavilyResult
 from config_loader import config
@@ -34,6 +38,22 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Searcharvester", version="2.1.0")
+
+# ---------- CORS ----------
+# Frontend dev server is on :9762. Prod build served by the same origin or
+# another port the user runs — allow anything on localhost by default, tighten
+# via env var if needed.
+_cors_origins = os.environ.get(
+    "CORS_ORIGINS",
+    "http://localhost:9762,http://127.0.0.1:9762,http://localhost:8000",
+).split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in _cors_origins if o.strip()],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ---------- Orchestrator singleton ----------
@@ -454,6 +474,47 @@ def _job_to_status(job: Job) -> ResearchStatus:
     )
 
 
+def _job_phase(job: Job) -> str:
+    """Cheap phase heuristic based on workspace contents.
+
+    - queued / cancelled / failed / timeout / completed → pass-through of status
+    - running without plan.md → "planning"
+    - running with plan.md, no notes.md → "gather"
+    - running with notes.md, no report.md → "synthesise"
+    - running with report.md → "verify"  (the agent is writing the REPORT_SAVED marker now)
+    """
+    if job.status != JobStatus.running:
+        return job.status.value
+    ws = job.workspace_path
+    if ws is None:
+        return "running"
+    try:
+        if (ws / "report.md").exists():
+            return "verify"
+        if (ws / "notes.md").exists():
+            return "synthesise"
+        if (ws / "plan.md").exists():
+            return "gather"
+    except Exception:
+        pass
+    return "planning"
+
+
+def _job_artifacts(job: Job) -> dict[str, int]:
+    """Map artifact name → size in bytes, for debug pane in the UI."""
+    if job.workspace_path is None:
+        return {}
+    out: dict[str, int] = {}
+    for name in ("plan.md", "notes.md", "report.md", "hermes.log"):
+        p = job.workspace_path / name
+        try:
+            if p.exists():
+                out[name] = p.stat().st_size
+        except Exception:
+            pass
+    return out
+
+
 @app.post("/research", response_model=ResearchCreated, status_code=202)
 async def research_create(req: ResearchRequest) -> dict[str, str]:
     orch = _ensure_orchestrator()
@@ -480,6 +541,69 @@ async def research_logs(job_id: str) -> dict[str, str]:
     if logs is None:
         raise HTTPException(status_code=404, detail="Logs not available yet")
     return {"job_id": job_id, "logs": logs}
+
+
+@app.get("/research/{job_id}/events")
+async def research_events(job_id: str):
+    """Server-Sent Events stream for a single research job.
+
+    Emits one event per second while running, plus a terminal event on exit.
+    Events:
+      - status: {status, phase, elapsed_sec, artifacts}
+      - completed: {status, phase, duration_sec, report, artifacts}
+      - failed | timeout | cancelled: {status, error, artifacts}
+
+    Client sample (JS):
+        const es = new EventSource(`/research/${jobId}/events`);
+        es.addEventListener("status", e => setState(JSON.parse(e.data)));
+        es.addEventListener("completed", e => {setFinal(JSON.parse(e.data)); es.close();});
+    """
+    orch = _ensure_orchestrator()
+    job = orch.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    async def event_stream():
+        last_payload: dict[str, Any] | None = None
+        terminal = {JobStatus.completed, JobStatus.failed, JobStatus.timeout, JobStatus.cancelled}
+        while True:
+            current = orch.get(job_id)
+            if current is None:
+                # Job vanished (shouldn't happen during normal life).
+                yield {"event": "failed", "data": json.dumps({"status": "failed", "error": "job removed"})}
+                return
+
+            phase = _job_phase(current)
+            elapsed = None
+            if current.started_at:
+                base = current.finished_at or datetime.now(timezone.utc)
+                elapsed = (base - current.started_at).total_seconds()
+
+            payload: dict[str, Any] = {
+                "status": current.status.value,
+                "phase": phase,
+                "elapsed_sec": round(elapsed, 1) if elapsed is not None else None,
+                "artifacts": _job_artifacts(current),
+            }
+
+            if current.status in terminal:
+                # Attach terminal-only fields.
+                payload["duration_sec"] = current.duration_sec
+                payload["report"] = current.report
+                payload["error"] = current.error
+                event_name = current.status.value  # "completed", "failed", "timeout", "cancelled"
+                yield {"event": event_name, "data": json.dumps(payload, ensure_ascii=False)}
+                return
+
+            # Only emit a "status" event when payload changed or every 5s
+            # (keepalive). Keeps the stream quiet when nothing's happening.
+            if payload != last_payload:
+                yield {"event": "status", "data": json.dumps(payload, ensure_ascii=False)}
+                last_payload = payload
+
+            await asyncio.sleep(1.0)
+
+    return EventSourceResponse(event_stream())
 
 
 @app.delete("/research/{job_id}")
