@@ -40,3 +40,8 @@ venv.bak/
 # Environment variables
 .env.local
 .env.production
+
+# Hermes agent runtime state
+hermes-data/
+jobs/
+.env.hermes

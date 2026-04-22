@@ -2,31 +2,100 @@
 FastAPI server that provides Tavily-compatible API using SearXNG backend.
 
 Endpoints:
-- POST /search          — Tavily-совместимый поиск (ссылки + сниппеты + опц. raw_content)
-- POST /extract         — Извлечение контента страницы в markdown (s/m/l/f + пагинация)
-- GET  /extract/{id}/{page} — Следующие страницы для size=f
-- GET  /health          — health-check
+- POST /search                       — Tavily-совместимый поиск
+- POST /extract                      — Извлечение страницы в markdown (s/m/l/f)
+- GET  /extract/{id}/{page}          — Пагинация для size=f
+- POST /research                     — Запустить deep-research задачу (ephemeral Hermes)
+- GET  /research/{job_id}            — Статус / готовый report.md
+- GET  /research/{job_id}/logs       — Hermes stdout/stderr (для отладки)
+- DELETE /research/{job_id}          — Cancel активной задачи
+- GET  /health                       — health-check
 """
 import asyncio
 import hashlib
 import logging
 import math
+import os
 import time
 import uuid
+from pathlib import Path as FSPath
 from typing import Any, Literal
 
 import aiohttp
 import trafilatura
 from fastapi import FastAPI, HTTPException, Path
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, constr
 
 from tavily_client import TavilyResponse, TavilyResult
 from config_loader import config
+from orchestrator import Orchestrator, Job, JobStatus
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="SearXNG Tavily Adapter", version="2.0.0")
+app = FastAPI(title="Searcharvester", version="2.1.0")
+
+
+# ---------- Orchestrator singleton ----------
+
+def _build_orchestrator() -> Orchestrator | None:
+    """Build Orchestrator lazily. None when Docker is unreachable (tests / init)."""
+    try:
+        import docker  # type: ignore
+    except ImportError:
+        logger.warning("docker package missing — /research disabled")
+        return None
+
+    docker_host = os.environ.get("DOCKER_HOST")  # e.g. tcp://socket-proxy:2375
+    try:
+        client = docker.DockerClient(base_url=docker_host) if docker_host else docker.from_env()
+        client.ping()
+    except Exception as e:
+        logger.warning("Docker unreachable (%s) — /research disabled", e)
+        return None
+
+    hermes_image = os.environ.get(
+        "HERMES_IMAGE", "nousresearch/hermes-agent:latest"
+    )
+    jobs_dir = FSPath(os.environ.get("JOBS_DIR", "/srv/searxng-docker/jobs"))
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    jobs_host_dir_env = os.environ.get("JOBS_DIR_HOST")
+    jobs_host_dir = FSPath(jobs_host_dir_env) if jobs_host_dir_env else None
+    hermes_data_host = os.environ.get("HERMES_DATA_HOST_PATH")
+    hermes_data_host_path = FSPath(hermes_data_host) if hermes_data_host else None
+
+    # Whitelist of env vars we pass through to Hermes.
+    pass_env_keys = [
+        "OPENAI_API_KEY", "OPENAI_BASE_URL",
+        "OPENROUTER_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY", "GOOGLE_API_KEY",
+        "OLLAMA_API_KEY", "OLLAMA_BASE_URL",
+        "NOUS_API_KEY",
+    ]
+    env = {k: os.environ[k] for k in pass_env_keys if k in os.environ}
+
+    return Orchestrator(
+        docker_client=client,
+        hermes_image=hermes_image,
+        skills=[
+            "searcharvester-deep-research",
+            "searcharvester-search",
+            "searcharvester-extract",
+        ],
+        jobs_dir=jobs_dir,
+        jobs_host_dir=jobs_host_dir,
+        hermes_data_host_path=hermes_data_host_path,
+        env=env,
+        adapter_url_for_hermes=os.environ.get(
+            "ADAPTER_URL_FOR_HERMES", "http://host.docker.internal:8000"
+        ),
+        timeout_sec=int(os.environ.get("RESEARCH_TIMEOUT_SEC", "900")),
+        max_turns=int(os.environ.get("RESEARCH_MAX_TURNS", "30")),
+    )
+
+
+orchestrator: Orchestrator | None = _build_orchestrator()
 
 
 # ---------- Extract constants ----------
@@ -338,11 +407,101 @@ async def extract_page(
     )
 
 
+# ---------- /research ----------
+
+class ResearchRequest(BaseModel):
+    query: constr(min_length=1, max_length=2000)  # type: ignore[valid-type]
+
+
+class ResearchCreated(BaseModel):
+    job_id: str
+    status: str
+
+
+class ResearchStatus(BaseModel):
+    job_id: str
+    status: str
+    query: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    duration_sec: float | None = None
+    report: str | None = None
+    error: str | None = None
+
+
+def _ensure_orchestrator() -> Orchestrator:
+    if orchestrator is None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Research orchestrator is not available (Docker unreachable). "
+                "Check DOCKER_HOST / docker-socket-proxy."
+            ),
+        )
+    return orchestrator
+
+
+def _job_to_status(job: Job) -> ResearchStatus:
+    return ResearchStatus(
+        job_id=job.id,
+        status=job.status.value,
+        query=job.query,
+        started_at=job.started_at.isoformat() if job.started_at else None,
+        finished_at=job.finished_at.isoformat() if job.finished_at else None,
+        duration_sec=job.duration_sec,
+        report=job.report,
+        error=job.error,
+    )
+
+
+@app.post("/research", response_model=ResearchCreated, status_code=202)
+async def research_create(req: ResearchRequest) -> dict[str, str]:
+    orch = _ensure_orchestrator()
+    job_id = await orch.spawn(query=req.query)
+    return {"job_id": job_id, "status": "queued"}
+
+
+@app.get("/research/{job_id}", response_model=ResearchStatus)
+async def research_get(job_id: str) -> ResearchStatus:
+    orch = _ensure_orchestrator()
+    job = orch.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    return _job_to_status(job)
+
+
+@app.get("/research/{job_id}/logs")
+async def research_logs(job_id: str) -> dict[str, str]:
+    orch = _ensure_orchestrator()
+    job = orch.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    logs = orch.read_logs(job_id)
+    if logs is None:
+        raise HTTPException(status_code=404, detail="Logs not available yet")
+    return {"job_id": job_id, "logs": logs}
+
+
+@app.delete("/research/{job_id}")
+async def research_cancel(job_id: str) -> dict[str, Any]:
+    orch = _ensure_orchestrator()
+    job = orch.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    cancelled = await orch.cancel(job_id)
+    return {"job_id": job_id, "cancelled": cancelled, "status": orch.get(job_id).status.value}
+
+
 # ---------- /health ----------
 
 @app.get("/health")
-async def health() -> dict[str, str]:
-    return {"status": "ok", "service": "searxng-tavily-adapter", "version": "2.0.0"}
+async def health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "service": "searcharvester",
+        "version": "2.1.0",
+        "orchestrator": "available" if orchestrator is not None else "unavailable",
+    }
 
 
 if __name__ == "__main__":
