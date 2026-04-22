@@ -10,6 +10,7 @@ import {
   Cpu,
   Container as ContainerIcon,
   Info,
+  Users,
 } from "lucide-react";
 
 interface Props {
@@ -32,22 +33,34 @@ export default function LogTimeline({ rawLog }: Props) {
     );
   }
 
-  // Count agent tool calls so we can show a "single-threaded, no sub-agents"
-  // note that's accurate (and reminds the user what they're looking at).
   const toolCalls = events.filter((e) =>
     ["search", "extract", "write_report", "other_tool"].includes(e.kind)
   ).length;
+  const subAgents = events.filter((e) => e.kind === "delegate_start").length;
 
   return (
     <div className="space-y-2">
-      {toolCalls > 0 && (
+      {(toolCalls > 0 || subAgents > 0) && (
         <div className="flex items-start gap-2 px-2.5 py-1.5 rounded-md bg-base-800/60 border border-base-700 text-xs text-slate-400">
           <Info size={12} className="shrink-0 mt-0.5 text-slate-500" />
           <div className="leading-relaxed">
-            Single agent, sequential tool calls ({toolCalls} so far).{" "}
-            <span className="text-slate-500">
-              Parallel sub-agents via Hermes' <code className="font-mono">delegate_task</code> — not yet.
-            </span>
+            {subAgents > 0 ? (
+              <>
+                <span className="text-accent-400 font-semibold">
+                  {subAgents} parallel sub-agents
+                </span>{" "}
+                dispatched via Hermes <code className="font-mono">delegate_task</code>
+                {toolCalls > 0 && <>, {toolCalls} tool calls total across them</>}.
+              </>
+            ) : (
+              <>
+                Lead agent running{" "}
+                <span className="text-slate-300 font-semibold">{toolCalls}</span> tool
+                calls sequentially. When the skill triggers{" "}
+                <code className="font-mono">delegate_task</code>, parallel sub-agents
+                will appear here.
+              </>
+            )}
           </div>
         </div>
       )}
@@ -129,6 +142,33 @@ function renderEvent(ev: LogEvent) {
           <div className="shrink-0 flex items-center gap-1 text-xs">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_6px_rgba(16,185,129,0.6)]" />
             <span className="text-emerald-400 font-semibold uppercase tracking-wider">done</span>
+          </div>
+        </>
+      );
+    case "delegate_start":
+      return (
+        <>
+          <div className="shrink-0 mt-0.5 text-cyan-400">
+            <Users size={14} />
+          </div>
+          <div className="flex-1 min-w-0">
+            <span className="text-cyan-400 font-semibold uppercase text-xs mr-2 tracking-wider">
+              sub-agent
+            </span>
+            <span className="text-slate-200">{ev.goal}</span>
+          </div>
+          {renderDuration(ev.duration)}
+        </>
+      );
+    case "delegate_done":
+      return (
+        <>
+          <div className="shrink-0 mt-0.5 text-cyan-500">
+            <CheckCircle2 size={14} />
+          </div>
+          <div className="flex-1 min-w-0 text-cyan-300/80 text-xs">
+            sub-agent returned
+            {ev.goal ? <span className="text-slate-500"> · {ev.goal}</span> : null}
           </div>
         </>
       );

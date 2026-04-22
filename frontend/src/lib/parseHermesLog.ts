@@ -19,6 +19,8 @@
 export type LogEvent =
   | { kind: "orch_spawn"; text: string }        // orchestrator spawned the agent container
   | { kind: "agent_init"; text: string }        // Hermes runtime booting
+  | { kind: "delegate_start"; goal: string; duration?: string } // lead → sub-agent
+  | { kind: "delegate_done"; goal?: string }   // sub-agent returned
   | { kind: "search"; query: string; maxResults?: number; duration?: string; error?: boolean }
   | { kind: "extract"; url: string; size?: string; duration?: string; error?: boolean }
   | { kind: "write_report"; duration?: string }
@@ -41,6 +43,13 @@ const API_RETRY_RE =
   /^⚠️\s*API call failed \(attempt (\d+)\/(\d+)\):\s*(.+?)\s*$/;
 const WAITING_RETRY_RE =
   /^⏳\s*Retrying in (\d+(?:\.\d+)?)s/;
+
+// Hermes prints delegate_task tool calls like:
+//   ┊ 🤖 $ delegate_task(goal="...", ...)   1.2s
+// or with the function-call style:
+//   ┊ 🤖 $ delegate_task goal="Research sub-question 1"   45.3s
+const DELEGATE_RE =
+  /^\s*┊\s*🤖\s*\$\s*delegate_task[ (]goal\s*=\s*"([^"]+)"[^\n]*?(\d+(?:\.\d+)?s)?\s*$/;
 
 export function parseHermesLog(raw: string): LogEvent[] {
   if (!raw) return [];
@@ -74,7 +83,13 @@ export function parseHermesLog(raw: string): LogEvent[] {
     if (line.includes("preparing searcharvester")) continue;
 
     // Order matters: specific tool shapes before OTHER_TOOL fallback.
-    let m = line.match(SEARCH_RE);
+    let m = line.match(DELEGATE_RE);
+    if (m) {
+      out.push({ kind: "delegate_start", goal: m[1], duration: m[2] });
+      continue;
+    }
+
+    m = line.match(SEARCH_RE);
     if (m) {
       out.push({
         kind: "search",
