@@ -153,64 +153,65 @@ Four always-running containers + one ephemeral per research job.
 ║  │  DOCKER ENGINE                                                         │  ║
 ║  │                                                                        │  ║
 ║  │  ┌──────────────────── network: searxng (bridge) ──────────────────┐   │  ║
-║  │  │                                                                  │   │  ║
+║  │  │                                                                 │   │  ║
 ║  │  │  ┌────────────────┐    internal HTTP    ┌──────────────────┐    │   │  ║
-║  │  │  │ tavily-adapter │◀──────────────────▶│ searxng          │    │   │  ║
-║  │  │  │ :8000 (exposed)│   /search?format=  │ :8080            │    │   │  ║
-║  │  │  │                │      json          │ (:8999 exposed)  │    │   │  ║
-║  │  │  │ FastAPI:       │                    └────────┬─────────┘    │   │  ║
-║  │  │  │  /search       │                             │ RESP         │   │  ║
-║  │  │  │  /extract      │                             ▼              │   │  ║
-║  │  │  │  /research     │                    ┌─────────────┐         │   │  ║
-║  │  │  │  /health       │                    │ valkey      │         │   │  ║
-║  │  │  │                │                    │ (redis)     │         │   │  ║
-║  │  │  │ + trafilatura  │                    │ (cache)     │         │   │  ║
-║  │  │  │ + orchestrator │                    └─────────────┘         │   │  ║
-║  │  │  └───────┬────────┘                                            │   │  ║
-║  │  │          │ Docker HTTP API                                     │   │  ║
-║  │  │          │ (create / start /                                   │   │  ║
-║  │  │          │  kill / rm / logs / wait)                           │   │  ║
-║  │  │          ▼                                                     │   │  ║
-║  │  │  ┌──────────────────────┐                                      │   │  ║
-║  │  │  │ docker-socket-proxy  │  Whitelist:                          │   │  ║
-║  │  │  │ :2375                │   CONTAINERS=1 POST=1 IMAGES=1       │   │  ║
-║  │  │  │                      │   (everything else denied)           │   │  ║
-║  │  │  └──────────┬───────────┘                                      │   │  ║
-║  │  └─────────────│──────────────────────────────────────────────────┘   │  ║
-║  │                │                                                      │  ║
-║  │                │ reads (ro) /var/run/docker.sock                      │  ║
-║  │                │  — adapter itself never touches it                   │  ║
-║  │                │                                                      │  ║
-║  │                ▼                                                      │  ║
-║  │        (host docker daemon)                                           │  ║
-║  │                │                                                      │  ║
-║  │                │ spawns ephemeral container                           │  ║
-║  │                ▼                                                      │  ║
-║  │        ┌───────────────────────────────────────────────┐              │  ║
-║  │        │ hermes-agent  (EPHEMERAL, one per /research) │              │  ║
-║  │        │                                              │              │  ║
-║  │        │   /opt/data   ← hermes-data bind mount       │              │  ║
-║  │        │   /workspace  ← jobs/{job_id} bind mount     │              │  ║
-║  │        │                                              │              │  ║
-║  │        │   Env: OPENAI_API_KEY, OPENAI_BASE_URL,      │              │  ║
-║  │        │        SEARCHARVESTER_URL                    │              │  ║
-║  │        │                                              │              │  ║
-║  │        │   Skills loaded at startup:                  │              │  ║
-║  │        │     - searcharvester-deep-research           │              │  ║
-║  │        │     - searcharvester-search                  │              │  ║
-║  │        │     - searcharvester-extract                 │              │  ║
-║  │        │                                              │              │  ║
-║  │        │   Exits 0 → container --rm                   │              │  ║
-║  │        └──┬────────────────────┬──────────────────────┘              │  ║
-║  │           │                    │                                     │  ║
-║  │           │                    │ HTTP via host.docker.internal:8000  │  ║
-║  │           │                    └─────────▶ tavily-adapter above      │  ║
-║  │           │                      (calls our /search and /extract)    │  ║
-║  │           │                                                          │  ║
-║  │           │                                                          │  ║
-║  └───────────│──────────────────────────────────────────────────────────┘  ║
-║              │                                                             ║
-╚══════════════│═════════════════════════════════════════════════════════════╝
+║  │  │  │ tavily-adapter │◀──────────────────▶│ searxng           │    │   │  ║
+║  │  │  │ :8000 (exposed)│   /search?format=  │ :8080             │    │   │  ║
+║  │  │  │                │      json          │ (:8999 exposed)   │    │   │  ║
+║  │  │  │ FastAPI:       │                    └────────┬──────────┘    │   │  ║
+║  │  │  │  /search       │                             │ RESP          │   │  ║
+║  │  │  │  /extract      │                             ▼               │   │  ║
+║  │  │  │  /research     │                    ┌─────────────┐          │   │  ║
+║  │  │  │  /health       │                    │ valkey      │          │   │  ║
+║  │  │  │                │                    │ (redis)     │          │   │  ║
+║  │  │  │ + trafilatura  │                    │ (cache)     │          │   │  ║
+║  │  │  │ + orchestrator │                    └─────────────┘          │   │  ║
+║  │  │  └───────┬────────┘                                             │   │  ║
+║  │  │          │ Docker HTTP API                                      │   │  ║
+║  │  │          │ (create / start /                                    │   │  ║
+║  │  │          │  kill / rm / logs / wait)                            │   │  ║
+║  │  │          ▼                                                      │   │  ║
+║  │  │  ┌──────────────────────┐                                       │   │  ║
+║  │  │  │ docker-socket-proxy  │  Whitelist:                           │   │  ║
+║  │  │  │ :2375                │   CONTAINERS=1 POST=1 IMAGES=1        │   │  ║
+║  │  │  │                      │   (everything else denied)            │   │  ║
+║  │  │  └──────────┬───────────┘                                       │   │  ║
+║  │  └─────────────│───────────────────────────────────────────────────┘   │  ║
+║  │                │                                                       │  ║
+║  │                │ reads (ro) /var/run/docker.sock                       │  ║
+║  │                │  — adapter itself never touches it                    │  ║
+║  │                │                                                       │  ║
+║  │                ▼                                                       │  ║
+║  │        (host docker daemon)                                            │  ║
+║  │                │                                                       │  ║
+║  │                │ spawns ephemeral container                            │  ║
+║  │                ▼                                                       │  ║
+║  │        ┌───────────────────────────────────────────────┐               │  ║
+║  │        │ hermes-agent  (EPHEMERAL, one per /research)  │               │  ║
+║  │        │                                               │               │  ║
+║  │        │   /opt/data   ← hermes-data bind mount        │               │  ║
+║  │        │   /workspace  ← jobs/{job_id} bind mount      │               │  ║
+║  │        │                                               │               │  ║
+║  │        │   Env: OPENAI_API_KEY, OPENAI_BASE_URL,       │               │  ║
+║  │        │        SEARCHARVESTER_URL                     │               │  ║
+║  │        │                                               │               │  ║
+║  │        │   Skills loaded at startup:                   │               │  ║
+║  │        │     - searcharvester-deep-research            │               │  ║
+║  │        │     - searcharvester-search                   │               │  ║
+║  │        │     - searcharvester-extract                  │               │  ║
+║  │        │                                               │               │  ║
+║  │        │   Exits 0 → container --rm                    │               │  ║
+║  │        └──┬────────────────────┬───────────────────────┘               │  ║
+║  │        └──┬────────────────────┬───────────────────────┘               │  ║
+║  │           │                    │                                       │  ║
+║  │           │                    │ HTTP via host.docker.internal:8000    │  ║
+║  │           │                    └─────────▶ tavily-adapter above        │  ║
+║  │           │                      (calls our /search and /extract)      │  ║
+║  │           │                                                            │  ║
+║  │           │                                                            │  ║
+║  └───────────│────────────────────────────────────────────────────────────┘  ║
+║              │                                                               ║
+╚══════════════│═══════════════════════════════════════════════════════════════╝
                │ HTTPS
                ▼
       ┌─────────────────────────────────────────────┐
@@ -251,19 +252,19 @@ Client                tavily-adapter           socket-proxy      hermes (ephemer
   │                         │                       │                   │──load skills     │
   │                         │                       │                   │──chat with LLM──▶│
   │                         │                       │                   │◀──tool_call──────│
-  │                         │                       │                   │    "search(...)"  │
+  │                         │                       │                   │    "search(...)" │
   │                         │                       │                   │                  │
-  │                         │◀──HTTP /search───────────────────────────│                  │
+  │                         │◀──HTTP /search────────────────────────────│                  │
   │                         │──SearXNG query                            │                  │
   │                         │──results JSON────────────────────────────▶│                  │
   │                         │                                           │                  │
-  │                         │                       │                   │──chat────────────▶│
+  │                         │                       │                   │──chat───────────▶│
   │                         │                       │                   │◀──tool_call──────│
-  │                         │                       │                   │    "extract(url)" │
-  │                         │◀──HTTP /extract──────────────────────────│                  │
+  │                         │                       │                   │    "extract(url)"│
+  │                         │◀──HTTP /extract───────────────────────────│                  │
   │                         │──trafilatura → md─────────────────────── ▶│                  │
   │                         │                                           │                  │
-  │                         │                       │                   │──chat────────────▶│
+  │                         │                       │                   │──chat───────────▶│
   │                         │                       │                   │◀──tool: bash──   │
   │                         │                       │                   │    "cat > /workspace/report.md"
   │                         │                       │                   │     + print "REPORT_SAVED:"
