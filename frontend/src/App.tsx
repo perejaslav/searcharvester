@@ -186,7 +186,7 @@ export default function App() {
   const isRunning = job !== null && finalStatus === null;
 
   return (
-    <div className="min-h-full pb-24">
+    <div className="min-h-full pb-12">
       {/* Header */}
       <header className="border-b border-base-800">
         <div className="max-w-4xl mx-auto px-4 py-4 flex items-center justify-between">
@@ -239,6 +239,14 @@ export default function App() {
           />
         )}
 
+        {job && (
+          <DebugDrawer
+            jobId={job.jobId}
+            events={events}
+            isRunning={isRunning}
+          />
+        )}
+
         {report && <ReportView report={report} onRunAgain={onRunAgain} />}
 
         {job && finalStatus && !report && (
@@ -252,12 +260,6 @@ export default function App() {
           </div>
         )}
       </main>
-
-      <DebugDrawer
-        jobId={job?.jobId ?? null}
-        events={events}
-        isRunning={isRunning}
-      />
     </div>
   );
 }

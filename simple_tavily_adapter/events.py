@@ -66,10 +66,13 @@ def normalize_acp_update(
     job_id: str,
     agent_id: str,
     parent_id: str | None,
-) -> Event | None:
-    """Convert one ACP `session_update` (typed pydantic model) into an Event.
+) -> list[Event]:
+    """Convert one ACP `session_update` into one-or-more normalized Events.
 
-    Returns None for updates we intentionally don't surface (e.g. keepalives).
+    Returns a list because some updates (notably delegate_task) expand into
+    multiple surface-level events: one for the lead's tool_call/result plus
+    synthetic spawn/done events for each sub-agent so the UI can draw
+    branches under the lead.
 
     Keeps coupling to the ACP SDK shallow: one function, one switch. If the
     ACP schema changes in a future Hermes release, this is the only place
@@ -85,16 +88,16 @@ def normalize_acp_update(
     if kind == "AgentThoughtChunk":
         d = dump(update)
         text = _extract_text_block(d.get("content"))
-        return _ev(job_id, agent_id, parent_id, "thought", {"text": text})
+        return [_ev(job_id, agent_id, parent_id, "thought", {"text": text})]
 
     if kind == "AgentMessageChunk":
         d = dump(update)
         text = _extract_text_block(d.get("content"))
-        return _ev(job_id, agent_id, parent_id, "message", {"text": text})
+        return [_ev(job_id, agent_id, parent_id, "message", {"text": text})]
 
     if kind == "ToolCallStart":
         d = dump(update)
-        return _ev(job_id, agent_id, parent_id, "tool_call", {
+        lead_ev = _ev(job_id, agent_id, parent_id, "tool_call", {
             "id": d.get("tool_call_id"),
             "title": d.get("title"),
             "kind": d.get("kind"),
@@ -102,30 +105,183 @@ def normalize_acp_update(
             "preview": _extract_tool_content_preview(d.get("content")),
             "locations": d.get("locations"),
         })
+        events: list[Event] = [lead_ev]
+        if _is_delegate_task(d.get("title")):
+            tasks = _extract_delegate_tasks(d.get("raw_input"))
+            call_id = d.get("tool_call_id") or ""
+            for i, task in enumerate(tasks, start=1):
+                sub_id = _sub_agent_id(call_id, i)
+                events.append(_ev(job_id, sub_id, agent_id, "spawn", {
+                    "goal": task.get("goal", "") if isinstance(task, dict) else "",
+                    "toolsets": task.get("toolsets") if isinstance(task, dict) else None,
+                    "delegate_call_id": call_id,
+                    "task_index": i - 1,
+                }))
+        return events
 
     if kind == "ToolCallProgress":
         d = dump(update)
-        return _ev(job_id, agent_id, parent_id, "tool_result", {
-            "id": d.get("tool_call_id"),
+        call_id = d.get("tool_call_id") or ""
+        # Full untruncated content for structured parsing; preview separately
+        # for the UI field.
+        full_content = _extract_tool_content_full(d.get("content"))
+        lead_ev = _ev(job_id, agent_id, parent_id, "tool_result", {
+            "id": call_id,
             "status": d.get("status"),
-            "content": _extract_tool_content_preview(d.get("content")),
+            "content": full_content[:2000],
         })
+        events = [lead_ev]
+        results = _extract_delegate_results_from_text(full_content)
+        if results:
+            for r in results:
+                idx = r.get("task_index")
+                if idx is None:
+                    continue
+                sub_id = _sub_agent_id(call_id, int(idx) + 1)
+                status = r.get("status", "completed")
+                summary = r.get("summary") or r.get("result") or ""
+                if summary:
+                    events.append(_ev(job_id, sub_id, agent_id, "message", {
+                        "text": summary if isinstance(summary, str) else str(summary),
+                    }))
+                events.append(_ev(job_id, sub_id, agent_id, "done", {
+                    "status": status,
+                    "error": r.get("error"),
+                    "delegate_call_id": call_id,
+                }))
+        return events
 
     if kind == "Plan":
-        return _ev(job_id, agent_id, parent_id, "plan", dump(update))
+        return [_ev(job_id, agent_id, parent_id, "plan", dump(update))]
 
     if kind == "AvailableCommandsUpdate":
         d = dump(update)
         cmds = d.get("available_commands") or d.get("commands") or []
-        # Flatten to just names — UI doesn't need argument schemas
         names = [c.get("name") if isinstance(c, dict) else str(c) for c in cmds]
-        return _ev(job_id, agent_id, parent_id, "commands", {"names": names})
+        return [_ev(job_id, agent_id, parent_id, "commands", {"names": names})]
 
-    # Everything else: surface as a generic note so nothing silently disappears.
-    return _ev(job_id, agent_id, parent_id, "note", {
+    return [_ev(job_id, agent_id, parent_id, "note", {
         "kind": kind,
         "data": dump(update),
-    })
+    })]
+
+
+def _is_delegate_task(title: Any) -> bool:
+    if not title:
+        return False
+    t = str(title).lower().strip()
+    # Hermes prints "delegate task" or "delegate_task" depending on version.
+    return t.startswith("delegate") and ("task" in t)
+
+
+def _extract_delegate_tasks(raw_input: Any) -> list[Any]:
+    """delegate_task `tasks=[...]` — list of {goal, context, toolsets}.
+
+    Some variants accept a single task via `goal=` + `context=`; treat that
+    as a 1-element list so downstream code is uniform.
+    """
+    if not isinstance(raw_input, dict):
+        return []
+    tasks = raw_input.get("tasks")
+    if isinstance(tasks, list):
+        return tasks
+    # Single-goal fallback
+    if "goal" in raw_input:
+        return [raw_input]
+    return []
+
+
+def _extract_delegate_results_from_text(text: str) -> list[dict[str, Any]] | None:
+    """The delegate_task tool_result serialises as JSON like
+    `{"results": [{"task_index": 0, "status": "completed", "summary": "..."}]}`.
+    Dig that out so we can attribute per-sub outcomes.
+
+    Hermes' ACP adapter caps tool_result content around 2000 chars per update,
+    so the JSON arriving here is often truncated. Fall back to a regex
+    scrape for {task_index, status, summary} when full json.loads fails —
+    partial data is better than none.
+    """
+    if not text or "task_index" not in text:
+        return None
+    import json as _json
+    import re
+    obj: Any = None
+    # First try: clean json.loads
+    try:
+        obj = _json.loads(text)
+    except Exception:
+        # Second try: trim to outermost braces
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                obj = _json.loads(text[start:end + 1])
+            except Exception:
+                obj = None
+    if isinstance(obj, dict) and isinstance(obj.get("results"), list):
+        return [r for r in obj["results"] if isinstance(r, dict)]
+
+    # Third try: regex-scrape task_index + status + (optional) summary.
+    # Works on truncated JSON — we just get whatever key-value pairs survived.
+    results: list[dict[str, Any]] = []
+    # Match one {...} object that contains task_index + status, greedy on
+    # the summary which may itself contain nested braces/strings.
+    obj_re = re.compile(
+        r'"task_index"\s*:\s*(\d+)[^{}]*?"status"\s*:\s*"(\w+)"'
+        r'(?:[^{}]*?"summary"\s*:\s*"((?:[^"\\]|\\.)*)")?',
+        re.DOTALL,
+    )
+    for m in obj_re.finditer(text):
+        idx = int(m.group(1))
+        status = m.group(2)
+        summary = m.group(3)
+        if summary is not None:
+            # Un-escape basic JSON string escapes so the UI shows readable text
+            summary = (
+                summary.replace("\\n", "\n")
+                .replace('\\"', '"')
+                .replace("\\\\", "\\")
+            )
+        entry: dict[str, Any] = {"task_index": idx, "status": status}
+        if summary:
+            entry["summary"] = summary
+        results.append(entry)
+    return results or None
+
+
+def _sub_agent_id(delegate_call_id: str, task_index_1based: int) -> str:
+    """Stable, unique agent_id for a sub-agent.
+
+    Scoped by the delegate_task call id so the same sub-1 from two different
+    batches doesn't collide. Short hex prefix keeps the id UI-friendly.
+    """
+    import hashlib
+    short = hashlib.blake2b(
+        (delegate_call_id or "anon").encode("utf-8"), digest_size=2
+    ).hexdigest()
+    return f"sub-{short}-{task_index_1based}"
+
+
+def _extract_tool_content_full(content: Any) -> str:
+    """Join ACP content blocks into a single untruncated string — used for
+    structured parsing (delegate results JSON). For UI previews, use
+    _extract_tool_content_preview() which caps length."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        chunks: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            inner = item.get("content")
+            if isinstance(inner, dict):
+                t = inner.get("text")
+                if t:
+                    chunks.append(str(t))
+        return "\n".join(chunks)
+    return str(content)
 
 
 def _ev(

@@ -297,10 +297,10 @@ class Orchestrator:
                 update: Any,
                 **_: Any,
             ) -> None:
-                ev = normalize_acp_update(
+                evs = normalize_acp_update(
                     update, job_id=job_id, agent_id="lead", parent_id=None,
                 )
-                if ev is not None:
+                for ev in evs:
                     await orch._emit(job, ev)
 
             async def request_permission(self, *a, **k):
