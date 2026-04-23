@@ -162,10 +162,32 @@ def test_delegate_task_tool_result_survives_truncated_json():
     })
     evs = normalize_acp_update(upd, job_id="j1", agent_id="lead", parent_id=None)
     dones = [e for e in evs if e.type == "done"]
-    # Two sub-agents recovered from the partial JSON
     assert len(dones) == 2
     statuses = sorted(e.payload["status"] for e in dones)
     assert statuses == ["completed", "error"]
+
+
+def test_delegate_task_regex_recovers_summary_when_cut_mid_string():
+    """Worst case: ACP cuts the buffer in the middle of the first summary's
+    text — no closing quote, no closing brace, no next task. Still, the
+    regex should emit a message event with the partial summary we have."""
+    # Realistic shape from Hermes when task 0's summary is large
+    cut = (
+        '{"results": [{"task_index": 0, "status": "completed", "summary": "'
+        '**What I did**\\n1. Ran a search.\\n2. Looked at several URLs and '
+        'extracted content. More text here that is long enough to be cut off'
+    )
+    upd = _make("ToolCallProgress", {
+        "tool_call_id": "tc-del",
+        "status": "completed",
+        "content": [{"content": {"type": "text", "text": cut}}],
+    })
+    evs = normalize_acp_update(upd, job_id="j1", agent_id="lead", parent_id=None)
+    messages = [e for e in evs if e.type == "message"]
+    assert len(messages) == 1
+    text = messages[0].payload["text"]
+    assert "What I did" in text
+    assert "Ran a search" in text
 
 
 def test_event_to_dict_is_jsonable():

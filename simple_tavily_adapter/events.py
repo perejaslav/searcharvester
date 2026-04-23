@@ -221,30 +221,41 @@ def _extract_delegate_results_from_text(text: str) -> list[dict[str, Any]] | Non
     if isinstance(obj, dict) and isinstance(obj.get("results"), list):
         return [r for r in obj["results"] if isinstance(r, dict)]
 
-    # Third try: regex-scrape task_index + status + (optional) summary.
-    # Works on truncated JSON — we just get whatever key-value pairs survived.
+    # Third try: regex-scrape task_index + status + summary. Robust to two
+    # truncation modes:
+    #   (a) Buffer ends AFTER a task's fields — we get the {task_index,status,
+    #       summary} fully for early tasks but later tasks may be absent.
+    #   (b) Buffer ends IN THE MIDDLE of a summary string — the status regex
+    #       still matches, but the summary has no closing quote. We handle
+    #       this by allowing the summary terminator to be `",`, `"}`, or EOF.
     results: list[dict[str, Any]] = []
-    # Match one {...} object that contains task_index + status, greedy on
-    # the summary which may itself contain nested braces/strings.
-    obj_re = re.compile(
-        r'"task_index"\s*:\s*(\d+)[^{}]*?"status"\s*:\s*"(\w+)"'
-        r'(?:[^{}]*?"summary"\s*:\s*"((?:[^"\\]|\\.)*)")?',
-        re.DOTALL,
+    # First pass: find every task_index+status anchor (cheap and robust).
+    status_re = re.compile(
+        r'"task_index"\s*:\s*(\d+)[^{}]*?"status"\s*:\s*"(\w+)"', re.DOTALL,
     )
-    for m in obj_re.finditer(text):
+    # Second pass (per task region): grab the summary, allowing the string to
+    # run off the end of the buffer without a closing quote.
+    summary_re = re.compile(
+        r'"summary"\s*:\s*"((?:[^"\\]|\\.)*?)(?:",|"\s*\}|$)', re.DOTALL,
+    )
+    anchors = list(status_re.finditer(text))
+    for i, m in enumerate(anchors):
         idx = int(m.group(1))
         status = m.group(2)
-        summary = m.group(3)
-        if summary is not None:
-            # Un-escape basic JSON string escapes so the UI shows readable text
+        entry: dict[str, Any] = {"task_index": idx, "status": status}
+        region_start = m.end()
+        region_end = anchors[i + 1].start() if i + 1 < len(anchors) else len(text)
+        region = text[region_start:region_end]
+        sm = summary_re.search(region)
+        if sm:
             summary = (
-                summary.replace("\\n", "\n")
+                sm.group(1)
+                .replace("\\n", "\n")
                 .replace('\\"', '"')
                 .replace("\\\\", "\\")
             )
-        entry: dict[str, Any] = {"task_index": idx, "status": status}
-        if summary:
-            entry["summary"] = summary
+            if summary:
+                entry["summary"] = summary
         results.append(entry)
     return results or None
 
