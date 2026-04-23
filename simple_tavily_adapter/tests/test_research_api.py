@@ -125,3 +125,9 @@ def test_research_token_accepts_correct_bearer(monkeypatch):
     assert r.status_code == 202
     assert r.json() == {"job_id": "abcdef0123456789", "status": "queued"}
     mock_orch.spawn.assert_awaited_once_with(query="what is RAG")
+
+
+def test_research_disabled_env_makes_orchestrator_unavailable(monkeypatch):
+    monkeypatch.setenv("RESEARCH_DISABLED", "1")
+    orch = main._build_orchestrator()
+    assert orch is None

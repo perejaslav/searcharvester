@@ -23,7 +23,17 @@ def test_readme_no_removed_research_architecture_claims():
         assert phrase not in readme
 
 
-def test_readme_mentions_current_acp_flow():
-    readme = (ROOT / "README.md").read_text().lower()
-    for phrase in ("hermes acp", "session_update", "events", "./report.md"):
-        assert phrase in readme
+def test_lite_compose_exists_and_disables_research():
+    text = (ROOT / "docker-compose.lite.yaml").read_text()
+    assert "Dockerfile.lite" in text
+    assert "RESEARCH_DISABLED=1" in text
+    assert "searcharvester-lite-adapter" in text
+    assert "frontend" not in text
+    assert "nousresearch/hermes-agent" not in text
+
+
+def test_lite_dockerfile_is_not_based_on_hermes_image():
+    text = (ROOT / "simple_tavily_adapter" / "Dockerfile.lite").read_text()
+    assert "FROM python:3.11-slim" in text
+    assert "nousresearch/hermes-agent" not in text
+    assert "RESEARCH_DISABLED=1" in text

@@ -11,6 +11,7 @@ Index of documents in this folder.
 | [getting-started.md](getting-started.md) | Install and run from scratch |
 | [operations.md](operations.md) | Day-to-day ops: logs, restart, debugging, troubleshooting |
 | [api.md](api.md) | HTTP API reference: requests, responses, examples |
+| [lite-mode.md](lite-mode.md) | Low-resource deployment: `/search` + `/extract`, no Hermes `/research` |
 
 Root repo files:
 

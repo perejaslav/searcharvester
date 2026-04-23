@@ -134,6 +134,22 @@ Important paths:
 
 ---
 
+## Lite Mode for small VPSes
+
+If the host is too small for the full Hermes-based stack, use Lite Mode. It runs only SearXNG + the lightweight Python adapter for `/search` and `/extract`; `/research` is disabled.
+
+```bash
+cp config.example.yaml config.yaml
+# edit server.secret_key
+
+docker compose -f docker-compose.lite.yaml up -d --build
+scripts/smoke.sh
+```
+
+See [docs/en/lite-mode.md](docs/en/lite-mode.md).
+
+---
+
 ## Configuration
 
 Create `config.yaml` from `config.example.yaml` and set a strong `server.secret_key`.

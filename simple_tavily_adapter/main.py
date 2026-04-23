@@ -59,9 +59,17 @@ app.add_middleware(
 # ---------- Orchestrator singleton ----------
 
 def _build_orchestrator() -> Orchestrator | None:
-    """Build Orchestrator. v2.2+ runs `hermes acp` as a subprocess in the same
-    container, so there's no Docker-daemon prereq. Returns None only if the
-    `hermes` binary isn't on PATH (e.g. running outside the baked image)."""
+    """Build Orchestrator for full mode.
+
+    Lite mode sets RESEARCH_DISABLED=1 and intentionally exposes only
+    /search + /extract. Full mode runs `hermes acp` as a subprocess in the
+    same container, so there's no Docker-daemon prereq. Returns None if the
+    `hermes` binary isn't on PATH.
+    """
+    if os.environ.get("RESEARCH_DISABLED", "").lower() in {"1", "true", "yes", "on"}:
+        logger.info("RESEARCH_DISABLED is set — /research disabled")
+        return None
+
     import shutil
     hermes_bin = os.environ.get("HERMES_BIN", "hermes")
     if shutil.which(hermes_bin) is None:
@@ -618,6 +626,8 @@ async def health() -> dict[str, Any]:
         "status": "ok",
         "service": "searcharvester",
         "version": "2.2.0",
+        "mode": os.environ.get("ADAPTER_MODE", "full"),
+        "research_enabled": orchestrator is not None,
         "orchestrator": "available" if orchestrator is not None else "unavailable",
     }
 
