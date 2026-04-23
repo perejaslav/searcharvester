@@ -38,8 +38,15 @@ Other settings (`adapter.searxng_url`, `adapter.scraper.*`, engine list) can sta
 ## 3. Start the stack
 
 ```bash
-docker compose up -d
+docker compose --env-file .env up -d
 ```
+Optional for `/research`:
+
+```bash
+cp .env.example .env
+# Fill LLM credentials and optionally RESEARCH_API_TOKEN
+```
+
 
 First run: a couple of minutes (pull SearXNG + Valkey images, pull adapter from GHCR). Subsequent runs: a few seconds.
 

@@ -165,3 +165,16 @@ docker compose up -d
 Ничего ценного в volumes не хранится — только кеш SearXNG и состояние Valkey. Можно спокойно делать `docker compose down -v` без потери данных.
 
 Исключение — ваш `config.yaml`. Храните его в менеджере секретов / приватной репе, если используете уникальные настройки или `secret_key`.
+
+## Smoke-проверка
+
+После запуска стека выполните:
+
+```bash
+scripts/smoke.sh
+```
+
+Скрипт проверяет `/health`, `/search` и `/extract`. `/research` запускается только с `RUN_RESEARCH_SMOKE=1`, потому что требует LLM credentials.
+
+
+- `RESEARCH_API_TOKEN`: optional bearer-token protection for `/research` endpoints. Native browser EventSource cannot send Authorization headers; protect the bundled UI with an outer reverse proxy when using this in browsers.

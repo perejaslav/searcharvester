@@ -21,7 +21,7 @@ services:
     networks:
       - searxng
     ports:
-      - "0.0.0.0:8999:8080"
+      - "127.0.0.1:8999:8080"
     volumes:
       - ./config.yaml:/etc/searxng/settings.yml:ro
       - searxng-data:/var/cache/searxng:rw
@@ -46,7 +46,7 @@ services:
     networks:
       - searxng
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       - ./config.yaml:/srv/searxng-docker/config.yaml:ro
       # Per-job workspaces (plan.md, notes.md, report.md, hermes.log,
@@ -70,6 +70,11 @@ services:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - OLLAMA_API_KEY=${OLLAMA_API_KEY:-}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
+      - NOUS_API_KEY=${NOUS_API_KEY:-}
+      - RESEARCH_API_TOKEN=${RESEARCH_API_TOKEN:-}
     depends_on:
       - searxng
     healthcheck:
@@ -92,7 +97,7 @@ services:
     container_name: searcharvester-frontend
     restart: unless-stopped
     ports:
-      - "9762:9762"
+      - "127.0.0.1:9762:9762"
     depends_on:
       - tavily-adapter
     logging:

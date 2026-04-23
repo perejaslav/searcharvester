@@ -172,3 +172,16 @@ If you're going to expose the stack publicly:
 Nothing valuable lives in volumes — just SearXNG cache and Valkey state. Safe to `docker compose down -v` without data loss.
 
 Exception — your `config.yaml`. Store it in a secrets manager / private repo if you use unique settings or a critical `secret_key`.
+
+## Smoke check
+
+After starting the stack, run:
+
+```bash
+scripts/smoke.sh
+```
+
+This checks `/health`, `/search`, and `/extract`. `/research` is gated behind `RUN_RESEARCH_SMOKE=1` because it needs LLM credentials.
+
+
+- `RESEARCH_API_TOKEN`: optional bearer-token protection for `/research` endpoints. Native browser EventSource cannot send Authorization headers; protect the bundled UI with an outer reverse proxy when using this in browsers.

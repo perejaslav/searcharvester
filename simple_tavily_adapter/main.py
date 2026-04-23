@@ -25,12 +25,12 @@ from typing import Any, Literal
 
 import aiohttp
 import trafilatura
-from fastapi import FastAPI, HTTPException, Path
+from fastapi import Depends, FastAPI, Header, HTTPException, Path
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, constr
 from sse_starlette.sse import EventSourceResponse
 
-from tavily_client import TavilyResponse, TavilyResult
+from models import TavilyResponse, TavilyResult
 from config_loader import config
 from orchestrator import Orchestrator, Job, JobStatus
 
@@ -444,6 +444,19 @@ def _ensure_orchestrator() -> Orchestrator:
     return orchestrator
 
 
+
+def require_research_token(authorization: str | None = Header(default=None)) -> None:
+    """Optional bearer-token protection for research endpoints.
+
+    Set RESEARCH_API_TOKEN to require `Authorization: Bearer <token>`.
+    When unset, behavior remains unchanged for local/dev deployments.
+    """
+    token = os.environ.get("RESEARCH_API_TOKEN")
+    if not token:
+        return
+    if authorization != f"Bearer {token}":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
 def _job_to_status(job: Job) -> ResearchStatus:
     return ResearchStatus(
         job_id=job.id,
@@ -498,14 +511,14 @@ def _job_artifacts(job: Job) -> dict[str, int]:
     return out
 
 
-@app.post("/research", response_model=ResearchCreated, status_code=202)
+@app.post("/research", response_model=ResearchCreated, status_code=202, dependencies=[Depends(require_research_token)])
 async def research_create(req: ResearchRequest) -> dict[str, str]:
     orch = _ensure_orchestrator()
     job_id = await orch.spawn(query=req.query)
     return {"job_id": job_id, "status": "queued"}
 
 
-@app.get("/research/{job_id}", response_model=ResearchStatus)
+@app.get("/research/{job_id}", response_model=ResearchStatus, dependencies=[Depends(require_research_token)])
 async def research_get(job_id: str) -> ResearchStatus:
     orch = _ensure_orchestrator()
     job = orch.get(job_id)
@@ -514,7 +527,7 @@ async def research_get(job_id: str) -> ResearchStatus:
     return _job_to_status(job)
 
 
-@app.get("/research/{job_id}/logs")
+@app.get("/research/{job_id}/logs", dependencies=[Depends(require_research_token)])
 async def research_logs(job_id: str) -> dict[str, str]:
     orch = _ensure_orchestrator()
     job = orch.get(job_id)
@@ -526,7 +539,7 @@ async def research_logs(job_id: str) -> dict[str, str]:
     return {"job_id": job_id, "logs": logs}
 
 
-@app.get("/research/{job_id}/events")
+@app.get("/research/{job_id}/events", dependencies=[Depends(require_research_token)])
 async def research_events(job_id: str):
     """SSE stream of typed agent events for a research job.
 
@@ -569,7 +582,7 @@ async def research_events(job_id: str):
     return EventSourceResponse(event_stream())
 
 
-@app.get("/research/{job_id}/snapshot")
+@app.get("/research/{job_id}/snapshot", dependencies=[Depends(require_research_token)])
 async def research_snapshot(job_id: str) -> dict[str, Any]:
     """Return the full event log so far (no streaming). Useful for
     non-SSE clients or reconnecting UIs that already got a `since_ts`."""
@@ -587,7 +600,7 @@ async def research_snapshot(job_id: str) -> dict[str, Any]:
     }
 
 
-@app.delete("/research/{job_id}")
+@app.delete("/research/{job_id}", dependencies=[Depends(require_research_token)])
 async def research_cancel(job_id: str) -> dict[str, Any]:
     orch = _ensure_orchestrator()
     job = orch.get(job_id)

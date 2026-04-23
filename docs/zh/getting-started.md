@@ -38,8 +38,15 @@ head -c 32 /dev/urandom | xxd -p -c 32
 ## 3. 启动技术栈
 
 ```bash
-docker compose up -d
+docker compose --env-file .env up -d
 ```
+`/research` 可选配置：
+
+```bash
+cp .env.example .env
+# 填写 LLM 凭据，可选 RESEARCH_API_TOKEN
+```
+
 
 首次启动需要几分钟（拉取 SearXNG + Valkey 镜像、构建适配器）。后续启动只需几秒。
 

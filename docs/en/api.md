@@ -2,7 +2,7 @@
 
 Base URL: `http://localhost:8000` (or wherever you published port `8000` of the `tavily-adapter` container).
 
-No auth. Any `api_key` in requests is ignored — it's accepted only for compatibility with Tavily clients.
+`/search` and `/extract` have no built-in auth. Tavily-style `api_key` values are ignored for compatibility. `/research*` endpoints require `Authorization: Bearer <RESEARCH_API_TOKEN>` when `RESEARCH_API_TOKEN` is configured.
 
 Endpoints:
 

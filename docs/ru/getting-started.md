@@ -38,8 +38,15 @@ head -c 32 /dev/urandom | xxd -p -c 32
 ## 3. Запустить стек
 
 ```bash
-docker compose up -d
+docker compose --env-file .env up -d
 ```
+Опционально для `/research`:
+
+```bash
+cp .env.example .env
+# Заполните LLM credentials и при необходимости RESEARCH_API_TOKEN
+```
+
 
 Первый запуск — пару минут (pull SearXNG + Valkey образов, сборка адаптера). Последующие — несколько секунд.
 

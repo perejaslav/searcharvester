@@ -12,6 +12,7 @@ from orchestrator import Job, JobStatus
 
 @pytest.fixture
 def client(monkeypatch):
+    monkeypatch.delenv("RESEARCH_API_TOKEN", raising=False)
     mock_orch = MagicMock()
     mock_orch.spawn = AsyncMock(return_value="abcdef0123456789")
     mock_orch.cancel = AsyncMock(return_value=True)
@@ -79,3 +80,48 @@ def test_delete_research_calls_cancel(client):
     r = c.delete("/research/abc")
     assert r.status_code == 200
     orch.cancel.assert_awaited_once_with("abc")
+
+
+def test_research_token_required_when_configured(monkeypatch):
+    monkeypatch.setenv("RESEARCH_API_TOKEN", "test-token")
+    mock_orch = MagicMock()
+    mock_orch.spawn = AsyncMock(return_value="abcdef0123456789")
+    monkeypatch.setattr(main, "orchestrator", mock_orch)
+    c = TestClient(main.app)
+
+    r = c.post("/research", json={"query": "what is RAG"})
+    assert r.status_code == 401
+    mock_orch.spawn.assert_not_awaited()
+
+
+def test_research_token_rejects_wrong_bearer(monkeypatch):
+    monkeypatch.setenv("RESEARCH_API_TOKEN", "test-token")
+    mock_orch = MagicMock()
+    mock_orch.spawn = AsyncMock(return_value="abcdef0123456789")
+    monkeypatch.setattr(main, "orchestrator", mock_orch)
+    c = TestClient(main.app)
+
+    r = c.post(
+        "/research",
+        json={"query": "what is RAG"},
+        headers={"Authorization": "Bearer wrong"},
+    )
+    assert r.status_code == 401
+    mock_orch.spawn.assert_not_awaited()
+
+
+def test_research_token_accepts_correct_bearer(monkeypatch):
+    monkeypatch.setenv("RESEARCH_API_TOKEN", "test-token")
+    mock_orch = MagicMock()
+    mock_orch.spawn = AsyncMock(return_value="abcdef0123456789")
+    monkeypatch.setattr(main, "orchestrator", mock_orch)
+    c = TestClient(main.app)
+
+    r = c.post(
+        "/research",
+        json={"query": "what is RAG"},
+        headers={"Authorization": "Bearer test-token"},
+    )
+    assert r.status_code == 202
+    assert r.json() == {"job_id": "abcdef0123456789", "status": "queued"}
+    mock_orch.spawn.assert_awaited_once_with(query="what is RAG")

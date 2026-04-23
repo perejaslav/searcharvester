@@ -1,5 +1,7 @@
 # Documentation (EN)
 
+> Note: Searcharvester v2.2 uses ACP subprocess orchestration for `/research`. If any page conflicts with the root README, follow the root README.
+
 Index of documents in this folder.
 
 | Document | About |

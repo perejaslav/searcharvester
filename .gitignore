@@ -31,11 +31,15 @@ __pycache__/
 *$py.class
 *.so
 .Python
+.venv/
 env/
 venv/
 ENV/
 env.bak/
 venv.bak/
+
+# Local Hermes planning/runtime notes
+.hermes/
 
 # Environment variables
 .env.local

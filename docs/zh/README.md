@@ -1,5 +1,7 @@
 # 文档 (ZH)
 
+> 注意：Searcharvester v2.2 的 `/research` 使用 ACP 子进程编排。如果本文档与根 README 冲突，请以根 README 为准。
+
 本目录下文档的索引。
 
 | 文档 | 内容 |
