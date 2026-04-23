@@ -14,14 +14,6 @@ export type JobStatus =
   | "timeout"
   | "cancelled";
 
-export type Phase =
-  | "queued"
-  | "planning"
-  | "gather"
-  | "synthesise"
-  | "verify"
-  | JobStatus;
-
 export interface ResearchCreated {
   job_id: string;
   status: JobStatus;
@@ -38,14 +30,34 @@ export interface JobSnapshot {
   error: string | null;
 }
 
-export interface EventPayload {
+// --------- Agent events (mirror of events.py / Event dataclass) ---------
+
+export type AgentEventType =
+  | "spawn"
+  | "thought"
+  | "message"
+  | "tool_call"
+  | "tool_result"
+  | "plan"
+  | "commands"
+  | "note"
+  | "done";
+
+export interface AgentEvent {
+  ts: string;
+  job_id: string;
+  agent_id: string;
+  parent_id: string | null;
+  type: AgentEventType;
+  payload: Record<string, unknown>;
+}
+
+export interface JobTerminalStatus {
+  job_id: string;
   status: JobStatus;
-  phase: Phase;
-  elapsed_sec: number | null;
-  artifacts: Record<string, number>;
-  duration_sec?: number | null;
-  report?: string | null;
-  error?: string | null;
+  duration_sec: number | null;
+  has_report: boolean;
+  error: string | null;
 }
 
 // --------- Calls ---------
@@ -73,14 +85,6 @@ export async function cancelJob(jobId: string): Promise<void> {
   await fetch(`${API_URL}/research/${jobId}`, { method: "DELETE" });
 }
 
-export async function getLogs(jobId: string): Promise<string | null> {
-  const r = await fetch(`${API_URL}/research/${jobId}/logs`);
-  if (r.status === 404) return null;
-  if (!r.ok) throw new Error(`GET /research/${jobId}/logs: ${r.status}`);
-  const body = (await r.json()) as { logs?: string };
-  return body.logs ?? null;
-}
-
 export async function checkHealth(): Promise<{ status: string; orchestrator: string }> {
   const r = await fetch(`${API_URL}/health`);
   if (!r.ok) throw new Error(`GET /health: ${r.status}`);
@@ -93,41 +97,46 @@ export interface SSESubscription {
   close: () => void;
 }
 
-export type SSEEventKind =
-  | "status"
-  | "completed"
-  | "failed"
-  | "timeout"
-  | "cancelled";
+const EVENT_TYPES: AgentEventType[] = [
+  "spawn", "thought", "message",
+  "tool_call", "tool_result",
+  "plan", "commands", "note", "done",
+];
 
 /**
- * Subscribe to the SSE stream for a job. Each typed event (status/completed/
- * failed/...) triggers `onEvent` with the payload. When a terminal event
- * arrives, the backend closes; we also auto-close the EventSource here.
+ * Subscribe to the SSE stream of a research job. Each typed event fires
+ * `onEvent`; the final `status` frame (emitted once after `done`) fires
+ * `onFinal`, after which we close the EventSource.
  */
 export function subscribeToJob(
   jobId: string,
-  onEvent: (kind: SSEEventKind, payload: EventPayload) => void,
+  onEvent: (e: AgentEvent) => void,
+  onFinal: (s: JobTerminalStatus) => void,
   onError?: (e: Event) => void
 ): SSESubscription {
   const es = new EventSource(`${API_URL}/research/${jobId}/events`);
 
-  const kinds: SSEEventKind[] = ["status", "completed", "failed", "timeout", "cancelled"];
-  const terminal: SSEEventKind[] = ["completed", "failed", "timeout", "cancelled"];
-
-  for (const k of kinds) {
-    es.addEventListener(k, (ev: MessageEvent) => {
+  for (const t of EVENT_TYPES) {
+    es.addEventListener(t, (ev: MessageEvent) => {
       try {
-        const data = JSON.parse(ev.data) as EventPayload;
-        onEvent(k, data);
-        if (terminal.includes(k)) {
-          es.close();
-        }
+        const data = JSON.parse(ev.data) as AgentEvent;
+        onEvent(data);
       } catch (e) {
-        console.error("SSE parse error", e);
+        console.error("SSE parse error", t, e);
       }
     });
   }
+
+  es.addEventListener("status", (ev: MessageEvent) => {
+    try {
+      const data = JSON.parse(ev.data) as JobTerminalStatus;
+      onFinal(data);
+    } catch (e) {
+      console.error("SSE parse error (status)", e);
+    } finally {
+      es.close();
+    }
+  });
 
   es.onerror = (e) => {
     if (onError) onError(e);

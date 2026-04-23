@@ -5,7 +5,7 @@ description: >
   decompose it into 3–5 sub-questions, dispatch one batch of parallel sub-agents
   via delegate_task (each with searcharvester-search + searcharvester-extract
   skills), collect their structured findings, and synthesise a cited markdown
-  report at /workspace/report.md. Use for "research", "deep research", "report
+  report at ./report.md. Use for "research", "deep research", "report
   with sources", comparisons with citations, anything requiring 15+ grounded
   web sources.
 version: 2.1.0
@@ -27,7 +27,7 @@ metadata:
 
 Turn an open question into a cited markdown report grounded in 15+ web
 sources, produced by **parallel sub-agents** and synthesised by you (the
-lead). Save to `/workspace/report.md`.
+lead). Save to `./report.md`.
 
 ## Role
 
@@ -60,10 +60,10 @@ sub-agent actually extracted.
 
 ### Phase 1 — Decompose (lead)
 
-Write a plan to `/workspace/plan.md` using the `terminal` tool:
+Write a plan to `./plan.md` using the `terminal` tool:
 
 ```bash
-cat > /workspace/plan.md << 'EOF'
+cat > ./plan.md << 'EOF'
 ## Intent
 <one sentence on what the user wants>
 
@@ -162,7 +162,7 @@ Once `delegate_task` returns (it blocks until all sub-agents finish):
 1. Collect each sub-agent's markdown block from the returned JSON.
 2. Build a unified reference list — dedupe URLs, assign `[1]`, `[2]`, ...
    in order of first appearance.
-3. Write `/workspace/report.md`:
+3. Write `./report.md`:
 
 ```markdown
 # <Title reflecting the actual question>
@@ -195,14 +195,14 @@ Hard rules:
 ### Phase 4 — Verify and deliver
 
 Before closing:
-- [ ] `/workspace/report.md` exists and is > 500 bytes.
+- [ ] `./report.md` exists and is > 500 bytes.
 - [ ] References list has **≥ 15 unique URLs** (target 20–30).
 - [ ] Every non-TL;DR, non-References section has at least one `[n]`.
 - [ ] TL;DR is standalone (no citations, no "see below").
 
 Then print as the **very last line**:
 ```
-REPORT_SAVED: /workspace/report.md
+REPORT_SAVED: ./report.md
 ```
 
 ## Pitfalls
@@ -221,5 +221,5 @@ REPORT_SAVED: /workspace/report.md
   won't be able to run our search/extract scripts.
 - **Free-form sub-agent output.** Always require the "Sub-question
   findings" template. Free prose is painful to merge.
-- **Publishing the plan.** `/workspace/plan.md` is for context, not
-  output. Only `/workspace/report.md` reaches the user.
+- **Publishing the plan.** `./plan.md` is for context, not
+  output. Only `./report.md` reaches the user.

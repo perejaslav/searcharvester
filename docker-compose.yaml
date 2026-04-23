@@ -34,43 +34,11 @@ services:
         max-size: "1m"
         max-file: "1"
 
-  # Whitelist-style proxy to /var/run/docker.sock.
-  # The adapter talks to this instead of touching docker.sock directly —
-  # limits the blast radius if the adapter is compromised.
-  docker-socket-proxy:
-    container_name: docker-socket-proxy
-    image: tecnativa/docker-socket-proxy:0.3
-    restart: unless-stopped
-    networks:
-      - searxng
-    environment:
-      # Only allow what the orchestrator needs.
-      - CONTAINERS=1       # list, inspect, logs, wait
-      - POST=1             # create, start, kill, remove
-      - NETWORKS=0
-      - IMAGES=1           # inspect/pull image for hermes (optional)
-      - INFO=1
-      - PING=1
-      - VERSION=1
-      - VOLUMES=0
-      - SERVICES=0
-      - TASKS=0
-      - NODES=0
-      - SWARM=0
-      - SYSTEM=0
-      - EXEC=0
-      - BUILD=0
-      - DISABLE_IPV6=1
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "1m"
-        max-file: "1"
-
+  # Single container that serves the HTTP API *and* hosts the `hermes` CLI
+  # (inherited from nousresearch/hermes-agent). Per /research request, the
+  # adapter spawns `hermes acp` as a subprocess and speaks ACP JSON-RPC over
+  # stdio — no docker-in-docker, no socket-proxy.
   tavily-adapter:
-    # Pre-built из GHCR; для локальной разработки: `docker compose up --build`
     image: ghcr.io/vakovalskii/searcharvester:latest
     build: ./simple_tavily_adapter
     container_name: tavily-adapter
@@ -81,28 +49,22 @@ services:
       - "8000:8000"
     volumes:
       - ./config.yaml:/srv/searxng-docker/config.yaml:ro
-      # jobs/ — bind mount, куда Hermes-контейнеры будут писать report.md.
-      # Путь хоста прокидываем в env: HERMES видит его через docker API.
+      # Per-job workspaces (plan.md, notes.md, report.md, hermes.log,
+      # events.jsonl). Exposed on the host for inspection / post-mortem.
       - ./jobs:/srv/searxng-docker/jobs:rw
+      # HERMES_HOME — config.yaml, SOUL.md, skills. Bundled skills get
+      # synced on boot; our 3 custom skills ship alongside in skills/.
+      - ./hermes-data:/opt/data:rw
     environment:
-      # Where orchestrator reaches the Docker API (via socket-proxy).
-      - DOCKER_HOST=tcp://docker-socket-proxy:2375
-      # Which image to spawn for research jobs.
-      - HERMES_IMAGE=nousresearch/hermes-agent:latest
-      # Host-side path of jobs/ — Docker needs it for bind-mounts when spawning Hermes.
-      - JOBS_DIR_HOST=${PWD}/jobs
       - JOBS_DIR=/srv/searxng-docker/jobs
-      # Host-side path of hermes-data (skills dir).
-      - HERMES_DATA_HOST_PATH=${PWD}/hermes-data
-      # How the spawned Hermes container reaches this adapter.
-      - ADAPTER_URL_FOR_HERMES=http://host.docker.internal:8000
-      # Research job timeout (seconds).
+      - HERMES_HOME=/opt/data
+      - ADAPTER_URL_FOR_HERMES=http://localhost:8000
       - RESEARCH_TIMEOUT_SEC=900
-      # Raised from 30 to 60 so the agent has budget for 20-30 source extracts
-      # required by the searcharvester-deep-research skill.
-      - RESEARCH_MAX_TURNS=60
-      # LLM creds: pass-through — set these in the shell or an .env file.
-      # Supports OPENAI_API_KEY+OPENAI_BASE_URL, OPENROUTER_API_KEY, etc.
+      # Match the UID of the repo owner so mounted files stay owned by
+      # the right user. macOS: 501:20 is typical; override in .env if needed.
+      - HERMES_UID=${HERMES_UID:-501}
+      - HERMES_GID=${HERMES_GID:-20}
+      # LLM credentials — pass-through from the invoking shell / .env.
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
@@ -110,7 +72,6 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY:-}
     depends_on:
       - searxng
-      - docker-socket-proxy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -123,13 +84,10 @@ services:
         max-file: "1"
 
   # React + Tailwind + Vite UI over the /research API.
-  # Built as static files and served with `serve` on :9762.
-  # For local dev iteration you can also run `npm run dev` from ./frontend.
   frontend:
     build:
       context: ./frontend
       args:
-        # Same-machine default; override in env for reverse-proxy deploys.
         VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
     container_name: searcharvester-frontend
     restart: unless-stopped

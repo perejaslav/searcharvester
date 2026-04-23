@@ -4,11 +4,14 @@
 
 ## Что это за проект
 
-**Searcharvester 2.1.0** — self-hosted стек из трёх HTTP-сервисов и deep-research агента:
+**Searcharvester 2.2.0** — self-hosted стек из HTTP-сервисов и deep-research агента:
 
 - `POST /search` — Tavily-совместимый поиск через SearXNG (100+ движков)
 - `POST /extract` — URL → markdown через trafilatura, пресеты `s/m/l/f` + пагинация
-- `POST /research` — deep research: спавнит эфемерный Hermes-контейнер, возвращает цитируемый markdown-отчёт
+- `POST /research` — deep research: спавнит **subprocess `hermes acp`** в адаптере, стримит типизированные ACP-события в UI, возвращает цитируемый markdown-отчёт
+- `GET /research/{id}/events` — SSE поток нормализованных событий агента (spawn / thought / tool_call / tool_result / done)
+
+**v2.2 смена архитектуры:** было — эфемерный Docker-контейнер + stdout-regex. Стало — `FROM nousresearch/hermes-agent` + `hermes acp` subprocess + typed events через Python `acp` SDK. Нет больше docker-socket-proxy, нет docker-in-docker, нет regex-парсинга stdout.
 
 Примарно — английский README и документация (3 языка в `docs/`). Переписка со мной обычно на русском, но код-комментарии и доки англоязычные.
 
@@ -18,40 +21,42 @@ Pre-built образ в GHCR: `ghcr.io/vakovalskii/searcharvester:{latest,2.1.0}
 
 | Путь | Что это |
 |---|---|
-| `docker-compose.yaml` | 4 always-on сервиса: `redis`, `searxng`, `docker-socket-proxy`, `tavily-adapter` (+ эфемерный `hermes-agent` спавнится на `/research`) |
-| `config.yaml` | **gitignored**, создаётся из `config.example.yaml`; монтируется в SearXNG + адаптер |
-| `simple_tavily_adapter/` | исходники адаптера (FastAPI + trafilatura + docker-py) |
-| `simple_tavily_adapter/main.py` | роуты `/search`, `/extract`, `/research*`, `/health` |
-| `simple_tavily_adapter/orchestrator.py` | лайфсайкл research-job: spawn / watch / timeout / cancel / cleanup |
-| `simple_tavily_adapter/tests/` | unit + API тесты (19 штук), запекаются в образ |
+| `docker-compose.yaml` | 4 сервиса: `redis`, `searxng`, `tavily-adapter` (adapter + hermes в одном образе), `frontend` |
+| `config.yaml` | **gitignored**, SearXNG settings; монтируется в SearXNG + адаптер |
+| `simple_tavily_adapter/` | исходники адаптера (FastAPI + trafilatura + acp) |
+| `simple_tavily_adapter/Dockerfile` | `FROM nousresearch/hermes-agent` — hermes CLI внутри образа адаптера |
+| `simple_tavily_adapter/docker/entrypoint-adapter.sh` | Обёртка на entrypoint'ом hermes — поднимает HERMES_HOME + exec uvicorn |
+| `simple_tavily_adapter/main.py` | FastAPI: `/search`, `/extract`, `/research*`, `/health` |
+| `simple_tavily_adapter/orchestrator.py` | ACP-оркестратор: spawn `hermes acp` subprocess, connect_to_agent, forward session_update → Event |
+| `simple_tavily_adapter/events.py` | Нормализатор ACP events → flat `Event{ts,job_id,agent_id,parent_id,type,payload}` |
+| `simple_tavily_adapter/tests/` | `test_events.py` (normalizer) + `test_research_api.py` (routes, моки) — 12 unit-тестов |
 | `hermes_skills/` | три наших skill'а в `agentskills.io` формате: search, extract, deep-research |
-| `hermes-data/` | **gitignored**, volume для Hermes — туда синкаются наши skills |
-| `jobs/` | **gitignored**, workspace каждой research-задачи (plan.md, notes.md, report.md, hermes.log) |
+| `hermes-data/` | **gitignored**, HERMES_HOME: config.yaml, SOUL.md, skills/ |
+| `jobs/` | **gitignored**, workspace каждой research-задачи (report.md, hermes.log, **events.jsonl**) |
+| `frontend/src/lib/api.ts` | `subscribeToJob()` → EventSource → типизированные `AgentEvent` |
+| `frontend/src/components/LogTimeline.tsx` | Рендер timeline из типизированных событий (без regex) |
 | `bench/` | SimpleQA-20 smoke-бенч и харнесс |
-| `docs/{en,ru,zh}/` | документация на 3 языках + C4-диаграммы |
-| `Caddyfile`, `.env`, `searxng-docker.service.template`, `searxng/limiter.toml` | остатки от upstream searxng-docker, compose их не читает |
+| `docs/{en,ru,zh}/` | документация на 3 языках + C4-диаграммы (⚠ отстали от 2.2) |
 
-## Архитектура `/research` (ядро новой версии)
+## Архитектура `/research` (v2.2 — ACP)
 
 Поток:
 
 1. `POST /research {query}` → адаптер генерирует `job_id`, создаёт `jobs/{job_id}/`
-2. Оркестратор через **docker-socket-proxy** шлёт `containers/create` в Docker daemon
-3. Docker поднимает эфемерный `nousresearch/hermes-agent` контейнер:
-   - volume `./hermes-data` → `/opt/data` (скиллы + конфиг Hermes)
-   - volume `./jobs/{id}` → `/workspace` (куда агент пишет артефакты)
-   - env: `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `SEARCHARVESTER_URL=http://host.docker.internal:8000`
-   - CLI: `chat -Q -q "<query + mandatory contract suffix>" -s <skills> -t terminal --yolo --max-turns 30`
-4. Оркестратор (asyncio task) ждёт `container.wait()` с таймаутом
-5. По выходу читает логи, ищет маркер `REPORT_SAVED:`, если есть + `report.md` существует → `status=completed`
-6. Контейнер удаляется (`container.remove(force=True)`), его ресурсы освобождаются
+2. Оркестратор `asyncio.create_subprocess_exec("hermes", "acp", ...)` с `cwd=jobs/{id}` и env'ом из `.env.hermes` (OPENAI_API_KEY/BASE_URL, HERMES_HOME)
+3. `acp.connect_to_agent(client, proc.stdin, proc.stdout)` → initialize → new_session → prompt
+4. Каждый `session_update` callback-ом пролетает через `events.normalize_acp_update()` → нормализованный `Event` → append в `job.events` + `asyncio.Condition.notify_all()`
+5. Клиент (UI или curl) подписан на `/research/{id}/events` (SSE) — `orchestrator.subscribe()` отдаёт replay + live stream через ту же Condition
+6. `prompt` возвращается → читаем `report.md` → статус `completed` → эмитим финальный `done` event + `status` event → SSE закрывается
 
 Ключевые моменты:
 
-- **docker-socket-proxy** — whitelist'ит Docker API (`CONTAINERS=1 POST=1 IMAGES=1`, остальное 0). Адаптер ходит по `DOCKER_HOST=tcp://docker-socket-proxy:2375`, **не** касаясь `/var/run/docker.sock` напрямую. При компрометации адаптера получишь только create/start/kill/rm, не системный доступ.
-- **Mandatory contract**: оркестратор добавляет к каждому query `MANDATORY_SUFFIX` — жёсткое требование «сохрани в `/workspace/report.md` + напечатай `REPORT_SAVED:`». Без него gpt-oss-120b для простых вопросов «срезает» методологию и отвечает прямо в stdout.
-- **Host vs container paths**: в оркестраторе есть `jobs_dir` (внутри адаптера, для `mkdir` и чтения report.md) и `jobs_host_dir` (путь как видит Docker daemon на хосте, для bind-mount). Аналогично для hermes-data. **Не путать** — я уже один раз наступил на это.
-- **LLM-агностик**: `provider: "custom"` в `hermes-data/config.yaml` + `OPENAI_BASE_URL` + `OPENAI_API_KEY`. Это единственный правильный путь для vLLM / локальных endpoint'ов — `provider: "vllm"` из доков упоминается, но на рантайме enum не принимает.
+- **Один образ**: адаптер `FROM nousresearch/hermes-agent:latest` — hermes CLI лежит в PATH. `entrypoint-adapter.sh` повторяет логику upstream-ного entrypoint'а (HERMES_HOME bootstrap + gosu drop до user `hermes`) и затем `exec uvicorn`. Adapter и Hermes делят один контейнер → нет docker-in-docker, нет docker-socket-proxy.
+- **ACP SDK**: `from acp import Client, connect_to_agent` — библиотека `agent-client-protocol` **уже запечена в hermes venv**, нам её не надо доустанавливать. Используем subclass `Client` с `async session_update()` callback'ом.
+- **Flat Event schema** (`events.py`): `{ts, job_id, agent_id, parent_id, type, payload}`. `type` — union из `spawn|thought|message|tool_call|tool_result|plan|commands|note|done`. Транспорт-агностично — UI любого типа (React, curl -N, Python-клиент) потребляет одинаково. Если завтра уйдём с Hermes на Claude Code SDK, меняется только normalizer, не UI.
+- **events.jsonl** пишется on-the-fly в `jobs/{id}/events.jsonl` — post-mortem доступ без адаптера.
+- **cwd = job workspace**, без `/workspace` bind'а. Агент пишет в `./report.md`. `MANDATORY_SUFFIX` в `orchestrator.py` это говорит; SKILL.md тоже переведён на относительные пути.
+- **LLM-агностик**: `provider: "custom"` в `hermes-data/config.yaml` + `OPENAI_BASE_URL` + `OPENAI_API_KEY` (из `.env.hermes`, загружаемого `docker compose --env-file .env.hermes`). `provider: "vllm"` из доков на рантайме не принимается — используем "custom".
 
 ## Skills — три штуки
 
@@ -63,25 +68,25 @@ Pre-built образ в GHCR: `ghcr.io/vakovalskii/searcharvester:{latest,2.1.0}
 
 ## Тесты
 
-Написаны TDD-стилем (тесты раньше кода).
+- `tests/test_events.py` — 5 unit-тестов нормализатора ACP → Event. Не требуют Docker/hermes.
+- `tests/test_research_api.py` — 7 FastAPI route-тестов с моком оркестратора (AsyncMock).
+- `tests/test_e2e.py` — gated `RUN_E2E=1`. Реальный Hermes + vLLM end-to-end.
 
-- `tests/test_orchestrator.py` — 12 unit-тестов с `FakeDockerClient` (fake Docker SDK). Покрывают: spawn, workspace mkdir, volume mounts, start failure, watch/logs parsing, timeout+kill, cancel, параллельные spawn'ы.
-- `tests/test_research_api.py` — 7 FastAPI route-тестов с моком оркестратора. Покрывают: валидация query, статусы, отсутствие report на running, cancel.
-- `tests/test_e2e.py` — интеграционный тест, gated через `RUN_E2E=1`. Реальный Hermes + vLLM.
-
-Запуск быстро (всё запечено в образ):
+Старые `test_orchestrator.py` (FakeDockerClient) удалены — оркестратор больше не использует docker-py. Реальное покрытие "ACP subprocess → events" сейчас даёт E2E (или Playwright smoke через UI).
 
 ```bash
-docker compose exec tavily-adapter pytest -q        # unit + API, 19/19 за ~3с
-RUN_E2E=1 pytest tests/test_e2e.py -v               # E2E, ~1-2 минуты
+docker compose exec tavily-adapter /opt/hermes/.venv/bin/python -m pytest -q  # 12 passed за ~2с
+# (pytest не в PATH как алиас — идёт через venv-python)
 ```
 
 ## Известные шероховатости
 
 - **`score` результата `/search` — фейковый** (`0.9 - i*0.05`). Не настоящая релевантность.
-- **`/extract` кеш — в памяти, TTL 30 мин.** После рестарта `tavily-adapter` старые `id` инвалидны → клиент должен повторить `POST /extract`. Осознанно, без SQLite/Redis ради простоты.
-- **`tavily_client.py` отстал от `main.py`** — там BeautifulSoup-скрапинг и нет `/extract` логики. Либо синхронизируй, либо удали (HTTP API всё покрывает).
-- **`hermes_skills/` vs `hermes-data/skills/`** — source в первом, mount во втором. При правке скилла **надо копировать** в `hermes-data/skills/` (или пересоздать volume). TODO: автоматический sync в оркестраторе при старте.
+- **`/extract` кеш — в памяти, TTL 30 мин.** После рестарта `tavily-adapter` старые `id` инвалидны → клиент должен повторить `POST /extract`.
+- **Sub-agent events через ACP не видны**: `delegate_task` — это tool_call лида, но внутренности сабов (их search/extract) в parent ACP stream не прилетают. TODO: тейлить `~/.hermes/sessions/session_*.json` для каждого спавнутого саба и мёрджить в общий поток (через `parent_id`).
+- **`tavily_client.py` отстал от `main.py`** — там BeautifulSoup-скрапинг и нет `/extract` логики. Либо синхронизируй, либо удали.
+- **`hermes_skills/` vs `hermes-data/skills/`** — source в первом, mount во втором. При правке скилла **надо копировать** в `hermes-data/skills/`. TODO: автоматический sync в entrypoint.
+- **Изоляция agent ↔ adapter**: теперь в одном контейнере. Hermes `--yolo` terminal-команды выполняются в адаптерном user space. По сравнению с v2.1 (отдельный контейнер) — даунгрейд изоляции. Критично если кто-то скормит промпт с `rm -rf /app/…`. Пока ок для dev.
 - **`Caddyfile` не подключён** к compose — если нужен HTTPS, добавь сервис вручную.
 - **`limiter: false`** в `config.yaml` — SearXNG без анти-бот защиты. Ок для локалки, не ок для публичного endpoint'а.
 
@@ -95,4 +100,6 @@ RUN_E2E=1 pytest tests/test_e2e.py -v               # E2E, ~1-2 минуты
 - CLAUDE.md и переписка — на русском.
 - Не плоди новые markdown-файлы без нужды — проверь `docs/` сначала.
 - Секреты (`secret_key`, `OPENAI_API_KEY`) только в `config.yaml` / `.env.hermes` (оба gitignored), **никогда** в коде.
-- После изменений в `main.py` / `orchestrator.py` / `requirements.txt` — пересобрать образ: `docker compose build tavily-adapter && docker compose up -d`.
+- После изменений в `main.py` / `orchestrator.py` / `events.py` / `Dockerfile` / `entrypoint-adapter.sh` — пересобрать образ: `docker compose --env-file .env.hermes up -d --build tavily-adapter`.
+- **`--env-file .env.hermes` критично**: без него `OPENAI_API_KEY`/`OPENAI_BASE_URL` попадают в контейнер пустыми и `hermes acp` падает на первом же LLM-вызове.
+- LLM event schema — **контракт с UI**. Если добавляешь новый `type` в `events.py`, обнови `AgentEventType` в `frontend/src/lib/api.ts` + `renderEvent` в `LogTimeline.tsx`.

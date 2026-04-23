@@ -37,7 +37,7 @@ from orchestrator import Orchestrator, Job, JobStatus
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Searcharvester", version="2.1.0")
+app = FastAPI(title="Searcharvester", version="2.2.0")
 
 # ---------- CORS ----------
 # Frontend dev server is on :9762. Prod build served by the same origin or
@@ -59,32 +59,18 @@ app.add_middleware(
 # ---------- Orchestrator singleton ----------
 
 def _build_orchestrator() -> Orchestrator | None:
-    """Build Orchestrator lazily. None when Docker is unreachable (tests / init)."""
-    try:
-        import docker  # type: ignore
-    except ImportError:
-        logger.warning("docker package missing — /research disabled")
+    """Build Orchestrator. v2.2+ runs `hermes acp` as a subprocess in the same
+    container, so there's no Docker-daemon prereq. Returns None only if the
+    `hermes` binary isn't on PATH (e.g. running outside the baked image)."""
+    import shutil
+    hermes_bin = os.environ.get("HERMES_BIN", "hermes")
+    if shutil.which(hermes_bin) is None:
+        logger.warning("%s not on PATH — /research disabled", hermes_bin)
         return None
 
-    docker_host = os.environ.get("DOCKER_HOST")  # e.g. tcp://socket-proxy:2375
-    try:
-        client = docker.DockerClient(base_url=docker_host) if docker_host else docker.from_env()
-        client.ping()
-    except Exception as e:
-        logger.warning("Docker unreachable (%s) — /research disabled", e)
-        return None
-
-    hermes_image = os.environ.get(
-        "HERMES_IMAGE", "nousresearch/hermes-agent:latest"
-    )
     jobs_dir = FSPath(os.environ.get("JOBS_DIR", "/srv/searxng-docker/jobs"))
     jobs_dir.mkdir(parents=True, exist_ok=True)
-    jobs_host_dir_env = os.environ.get("JOBS_DIR_HOST")
-    jobs_host_dir = FSPath(jobs_host_dir_env) if jobs_host_dir_env else None
-    hermes_data_host = os.environ.get("HERMES_DATA_HOST_PATH")
-    hermes_data_host_path = FSPath(hermes_data_host) if hermes_data_host else None
 
-    # Whitelist of env vars we pass through to Hermes.
     pass_env_keys = [
         "OPENAI_API_KEY", "OPENAI_BASE_URL",
         "OPENROUTER_API_KEY",
@@ -96,22 +82,19 @@ def _build_orchestrator() -> Orchestrator | None:
     env = {k: os.environ[k] for k in pass_env_keys if k in os.environ}
 
     return Orchestrator(
-        docker_client=client,
-        hermes_image=hermes_image,
+        hermes_bin=hermes_bin,
         skills=[
             "searcharvester-deep-research",
             "searcharvester-search",
             "searcharvester-extract",
         ],
         jobs_dir=jobs_dir,
-        jobs_host_dir=jobs_host_dir,
-        hermes_data_host_path=hermes_data_host_path,
         env=env,
         adapter_url_for_hermes=os.environ.get(
-            "ADAPTER_URL_FOR_HERMES", "http://host.docker.internal:8000"
+            "ADAPTER_URL_FOR_HERMES", "http://localhost:8000"
         ),
         timeout_sec=int(os.environ.get("RESEARCH_TIMEOUT_SEC", "900")),
-        max_turns=int(os.environ.get("RESEARCH_MAX_TURNS", "30")),
+        hermes_home=os.environ.get("HERMES_HOME", "/opt/data"),
     )
 
 
@@ -454,8 +437,8 @@ def _ensure_orchestrator() -> Orchestrator:
         raise HTTPException(
             status_code=503,
             detail=(
-                "Research orchestrator is not available (Docker unreachable). "
-                "Check DOCKER_HOST / docker-socket-proxy."
+                "Research orchestrator is not available "
+                "(hermes binary not found on PATH)."
             ),
         )
     return orchestrator
@@ -545,18 +528,17 @@ async def research_logs(job_id: str) -> dict[str, str]:
 
 @app.get("/research/{job_id}/events")
 async def research_events(job_id: str):
-    """Server-Sent Events stream for a single research job.
+    """SSE stream of typed agent events for a research job.
 
-    Emits one event per second while running, plus a terminal event on exit.
-    Events:
-      - status: {status, phase, elapsed_sec, artifacts}
-      - completed: {status, phase, duration_sec, report, artifacts}
-      - failed | timeout | cancelled: {status, error, artifacts}
+    Each event is a normalized dict — see events.Event for schema:
+        {ts, job_id, agent_id, parent_id, type, payload}
 
-    Client sample (JS):
-        const es = new EventSource(`/research/${jobId}/events`);
-        es.addEventListener("status", e => setState(JSON.parse(e.data)));
-        es.addEventListener("completed", e => {setFinal(JSON.parse(e.data)); es.close();});
+    `type` values: spawn | thought | message | tool_call | tool_result |
+                   plan | commands | note | done
+
+    The stream replays the full history on subscribe, then appends live.
+    Closes after emitting the final `done` event (status == completed /
+    failed / timeout / cancelled).
     """
     orch = _ensure_orchestrator()
     job = orch.get(job_id)
@@ -564,46 +546,45 @@ async def research_events(job_id: str):
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
     async def event_stream():
-        last_payload: dict[str, Any] | None = None
-        terminal = {JobStatus.completed, JobStatus.failed, JobStatus.timeout, JobStatus.cancelled}
-        while True:
-            current = orch.get(job_id)
-            if current is None:
-                # Job vanished (shouldn't happen during normal life).
-                yield {"event": "failed", "data": json.dumps({"status": "failed", "error": "job removed"})}
-                return
-
-            phase = _job_phase(current)
-            elapsed = None
-            if current.started_at:
-                base = current.finished_at or datetime.now(timezone.utc)
-                elapsed = (base - current.started_at).total_seconds()
-
-            payload: dict[str, Any] = {
-                "status": current.status.value,
-                "phase": phase,
-                "elapsed_sec": round(elapsed, 1) if elapsed is not None else None,
-                "artifacts": _job_artifacts(current),
+        async for ev in orch.subscribe(job_id):
+            yield {
+                "event": ev.type,
+                "data": json.dumps(ev.to_dict(), ensure_ascii=False),
+            }
+        # Final status event (handy for clients that only care about the
+        # outcome and don't want to parse the last `done` payload).
+        final = orch.get(job_id)
+        if final is not None:
+            yield {
+                "event": "status",
+                "data": json.dumps({
+                    "job_id": final.id,
+                    "status": final.status.value,
+                    "duration_sec": final.duration_sec,
+                    "has_report": final.report is not None,
+                    "error": final.error,
+                }, ensure_ascii=False),
             }
 
-            if current.status in terminal:
-                # Attach terminal-only fields.
-                payload["duration_sec"] = current.duration_sec
-                payload["report"] = current.report
-                payload["error"] = current.error
-                event_name = current.status.value  # "completed", "failed", "timeout", "cancelled"
-                yield {"event": event_name, "data": json.dumps(payload, ensure_ascii=False)}
-                return
-
-            # Only emit a "status" event when payload changed or every 5s
-            # (keepalive). Keeps the stream quiet when nothing's happening.
-            if payload != last_payload:
-                yield {"event": "status", "data": json.dumps(payload, ensure_ascii=False)}
-                last_payload = payload
-
-            await asyncio.sleep(1.0)
-
     return EventSourceResponse(event_stream())
+
+
+@app.get("/research/{job_id}/snapshot")
+async def research_snapshot(job_id: str) -> dict[str, Any]:
+    """Return the full event log so far (no streaming). Useful for
+    non-SSE clients or reconnecting UIs that already got a `since_ts`."""
+    orch = _ensure_orchestrator()
+    job = orch.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    events = orch.snapshot(job_id)
+    return {
+        "job_id": job_id,
+        "status": job.status.value,
+        "phase": _job_phase(job),
+        "artifacts": _job_artifacts(job),
+        "events": [e.to_dict() for e in events],
+    }
 
 
 @app.delete("/research/{job_id}")
@@ -623,7 +604,7 @@ async def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "searcharvester",
-        "version": "2.1.0",
+        "version": "2.2.0",
         "orchestrator": "available" if orchestrator is not None else "unavailable",
     }
 

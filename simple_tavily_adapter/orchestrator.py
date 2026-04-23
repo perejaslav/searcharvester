@@ -1,40 +1,42 @@
 """
-Research job orchestrator.
+Research job orchestrator (ACP-based).
 
-Spawns a short-lived Hermes agent container per /research task, watches it to
-completion or timeout, reads the produced report.md, and cleans up.
+Per /research: spawn `hermes acp` as a subprocess, connect via the Python
+`acp` SDK, normalize every `session_update` into a flat Event, and expose
+the event stream over SSE.
 
-Design notes:
-- Containers are NOT run with --rm so we can always read logs (stdout/stderr)
-  after exit. We remove them manually in the watcher's finally block.
-- The container must print `REPORT_SAVED:` to stdout at the end as a
-  machine-readable success signal. Just writing report.md is not enough —
-  the skill methodology requires both.
-- Workspace for each job is a bind-mount of jobs/{job_id}/ on the host. Hermes
-  writes plan.md, notes.md, report.md, and we surface report.md via the API.
-- All async work runs on the event loop. Docker SDK calls are synchronous and
-  run in the default threadpool via asyncio.to_thread.
+Compared to the previous docker-py + stdout-regex approach this:
+  * drops the need for docker-socket-proxy (no per-job container spawn)
+  * drops the jobs_host_dir vs jobs_dir path-translation gotcha
+  * gives the UI typed events instead of us grepping emoji lines
+
+Public surface intentionally stays close to the old one: spawn / get /
+cancel / read_logs (compat) plus new: subscribe / events / snapshot.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
+
+from events import Event, normalize_acp_update
 
 logger = logging.getLogger(__name__)
 
-REPORT_MARKER = "REPORT_SAVED:"
 REPORT_FILENAME = "report.md"
 LOG_FILENAME = "hermes.log"
+EVENTS_FILENAME = "events.jsonl"
 
-# Appended to every user query before handing it to Hermes. Ensures the agent
-# always produces a file+marker, and that it leans toward "search the web and
-# cite sources" rather than reflexive refusals on legitimate research tasks.
+# Appended to every user query. Keeps the agent honest about where the final
+# report lives and nudges it away from reflexive refusals on legitimate
+# public-web research tasks.
 MANDATORY_SUFFIX = """
 
 ---
@@ -43,20 +45,11 @@ IMPORTANT — Role + output contract (applies to every task):
 ROLE: You are a web-research assistant. Use the searcharvester-search and
 searcharvester-extract tools to find publicly available information on the
 open web, then summarise it with citations to the sources you actually read.
-Do NOT refuse tasks that are valid public-web research — if the information
-(public profiles, work contacts, press mentions, company websites, etc.) is
-findable via a normal web search, your job is to gather it and cite where
-each fact came from. Only decline if the request is clearly for harassment,
-doxxing of a private individual, or other illegal/harmful intent. If a task
-is ambiguous, run searches first, then report what you did (or didn't) find.
+Do NOT refuse tasks that are valid public-web research.
 
-OUTPUT:
-1. Write your final answer to `/workspace/report.md` as markdown using the
-   terminal tool (e.g. `cat > /workspace/report.md << 'EOF' ... EOF`).
-2. As the VERY LAST line of your response, print exactly:
-   REPORT_SAVED: /workspace/report.md
-
-Both steps are non-negotiable."""
+OUTPUT: Your working directory is already the job workspace. Write your
+final answer as markdown to `./report.md` (relative path — do not use
+/workspace/, that path does not exist). This file is what the user sees."""
 
 
 class JobStatus(str, Enum):
@@ -73,7 +66,6 @@ class Job:
     id: str
     query: str
     status: JobStatus = JobStatus.queued
-    container_id: str | None = None
     workspace_path: Path | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
@@ -81,68 +73,50 @@ class Job:
     report: str | None = None
     error: str | None = None
 
-
-class DockerContainerProto(Protocol):
-    id: str
-
-    def logs(self, **kwargs: Any) -> bytes: ...
-    def wait(self, **kwargs: Any) -> dict: ...
-    def kill(self, **kwargs: Any) -> None: ...
-    def remove(self, **kwargs: Any) -> None: ...
-
-
-class DockerContainersAPIProto(Protocol):
-    def run(self, image: str, **kwargs: Any) -> DockerContainerProto: ...
-    def get(self, cid: str) -> DockerContainerProto: ...
-
-
-class DockerClientProto(Protocol):
-    containers: DockerContainersAPIProto
+    # Event log — appended to by the ACP session callback. Copied out via
+    # snapshot() for /events SSE.
+    events: list[Event] = field(default_factory=list)
+    _cond: asyncio.Condition | None = None
+    _process: Any = None  # asyncio.subprocess.Process | None
 
 
 class Orchestrator:
-    """Spawns + watches ephemeral Hermes research jobs."""
+    """Spawns + watches `hermes acp` sessions per research job."""
 
     def __init__(
         self,
-        docker_client: DockerClientProto,
-        hermes_image: str,
+        *,
+        hermes_bin: str = "hermes",
         skills: list[str],
         jobs_dir: Path,
         env: dict[str, str],
-        hermes_data_path: Path | None = None,
-        jobs_host_dir: Path | None = None,
-        hermes_data_host_path: Path | None = None,
-        adapter_url_for_hermes: str = "http://host.docker.internal:8000",
+        adapter_url_for_hermes: str = "http://localhost:8000",
         timeout_sec: int = 600,
-        max_turns: int = 30,
+        hermes_home: str | None = None,
     ) -> None:
         """
-        jobs_dir: path INSIDE this (adapter) container where we mkdir + read reports.
-        jobs_host_dir: same path as seen by the HOST Docker daemon (for bind mounts
-                       into the spawned Hermes container). Defaults to jobs_dir
-                       (fine for tests where no docker-in-docker is involved).
-        hermes_data_path / hermes_data_host_path: same split for Hermes skills volume.
+        hermes_bin: path to `hermes` executable (must be in $PATH of this process).
+        jobs_dir: filesystem directory where each job gets its own workspace.
+        env: LLM credentials / base URLs to pass through to Hermes.
+        adapter_url_for_hermes: HTTP URL of *this* adapter, as reachable from
+            the spawned hermes process. Since both run in the same container
+            now, "http://localhost:8000" is the sane default.
+        hermes_home: HERMES_HOME env var passed to subprocess (where skills/
+            config.yaml live). Defaults to $HERMES_HOME or /opt/data.
         """
-        self._client = docker_client
-        self._image = hermes_image
+        self._hermes_bin = hermes_bin
         self._skills = skills
         self._jobs_dir = jobs_dir
-        self._jobs_host_dir = jobs_host_dir or jobs_dir
-        self._hermes_data_path = hermes_data_path
-        self._hermes_data_host_path = hermes_data_host_path or hermes_data_path
         self._env = env
         self._adapter_url = adapter_url_for_hermes
         self._timeout = timeout_sec
-        self._max_turns = max_turns
+        self._hermes_home = hermes_home or os.environ.get("HERMES_HOME", "/opt/data")
         self._jobs: dict[str, Job] = {}
-        self._containers: dict[str, DockerContainerProto] = {}
         self._lock = asyncio.Lock()
 
     # ---------- public API ----------
 
     async def spawn(self, query: str) -> str:
-        """Start a research job, return its id."""
         job_id = uuid.uuid4().hex[:16]
         workspace = self._jobs_dir / job_id
         workspace.mkdir(parents=True, exist_ok=True)
@@ -154,304 +128,334 @@ class Orchestrator:
             workspace_path=workspace,
             started_at=datetime.now(timezone.utc),
         )
+        job._cond = asyncio.Condition()
         async with self._lock:
             self._jobs[job_id] = job
 
-        # Docker daemon sees the workspace under host-side path, not the one the
-        # adapter container sees.
-        workspace_host = self._jobs_host_dir / job_id
-
-        try:
-            container = await asyncio.to_thread(
-                self._client.containers.run,
-                self._image,
-                **self._run_kwargs(query, workspace_host),
-            )
-        except Exception as e:
-            logger.exception("Failed to start Hermes container for %s", job_id)
-            job.status = JobStatus.failed
-            job.error = f"Container start failed: {e}"
-            job.finished_at = datetime.now(timezone.utc)
-            return job_id
-
-        job.container_id = container.id
-        job.status = JobStatus.running
-        self._containers[job_id] = container
-        asyncio.create_task(self._watch(job_id))
+        asyncio.create_task(self._run(job_id, query))
         return job_id
 
     def get(self, job_id: str) -> Job | None:
         return self._jobs.get(job_id)
 
     async def cancel(self, job_id: str) -> bool:
-        """Kill a running job. Returns False if job unknown or already done."""
         job = self._jobs.get(job_id)
         if job is None:
             return False
         if job.status not in (JobStatus.queued, JobStatus.running):
             return False
-        container = self._containers.get(job_id)
-        if container is not None:
-            try:
-                await asyncio.to_thread(container.kill)
-            except Exception:
-                logger.exception("Failed to kill container for %s", job_id)
         job.status = JobStatus.cancelled
         job.finished_at = datetime.now(timezone.utc)
         if job.started_at:
             job.duration_sec = (job.finished_at - job.started_at).total_seconds()
+        if job._process and job._process.returncode is None:
+            try:
+                job._process.terminate()
+                try:
+                    await asyncio.wait_for(job._process.wait(), timeout=3)
+                except asyncio.TimeoutError:
+                    job._process.kill()
+            except Exception:
+                logger.exception("Failed to terminate hermes subprocess for %s", job_id)
+        await self._emit(job, Event.now(
+            job_id=job_id, agent_id="lead", type="done",
+            payload={"status": "cancelled"},
+        ))
         return True
 
-    def read_logs(self, job_id: str) -> str | None:
-        """Return the captured hermes.log contents, or None if not available yet."""
+    def snapshot(self, job_id: str) -> list[Event]:
         job = self._jobs.get(job_id)
-        if job is None or job.workspace_path is None:
-            return None
-        log_path = job.workspace_path / LOG_FILENAME
-        if not log_path.exists():
-            return None
-        return log_path.read_text(encoding="utf-8", errors="replace")
+        if job is None:
+            return []
+        return list(job.events)
 
-    # ---------- private ----------
+    async def subscribe(self, job_id: str):
+        """Async generator: yields new events for `job_id` as they arrive.
 
-    def _run_kwargs(self, query: str, workspace_host: Path) -> dict[str, Any]:
-        """Build kwargs for docker.containers.run for a research job.
-
-        `workspace_host` is the path as visible to the HOST Docker daemon,
-        used for bind-mount into the spawned Hermes container.
+        Starts by replaying the full history, then blocks on the condition
+        variable waiting for appends. Exits when the job reaches a terminal
+        state AND all events up to that point have been yielded.
         """
-        volumes: dict[str, dict[str, str]] = {
-            str(workspace_host): {"bind": "/workspace", "mode": "rw"},
+        job = self._jobs.get(job_id)
+        if job is None:
+            return
+        idx = 0
+        terminal = {
+            JobStatus.completed, JobStatus.failed,
+            JobStatus.timeout, JobStatus.cancelled,
         }
-        if self._hermes_data_host_path is not None:
-            volumes[str(self._hermes_data_host_path)] = {
-                "bind": "/opt/data",
-                "mode": "rw",
-            }
-        env = {
-            **self._env,
-            "SEARCHARVESTER_URL": self._adapter_url,
-        }
-        wrapped_query = query + MANDATORY_SUFFIX
-        # Toolsets passed to the lead agent:
-        #   terminal   — write plan.md / notes.md / report.md
-        #   delegation — expose delegate_task so the lead can spawn parallel
-        #                sub-agents when the skill calls for it
-        # NOT using -Q on purpose: quiet mode silences tool previews and the
-        # per-turn spinner, so the UI debug pane has nothing to show. The
-        # extra banner / exit-summary lines are filtered in
-        # _extract_agent_response.
-        return {
-            "command": [
-                "chat", "-q", wrapped_query,
-                "-s", ",".join(self._skills),
-                "-t", "terminal,delegation",
-                "--yolo",
-                "--max-turns", str(self._max_turns),
-            ],
-            "volumes": volumes,
-            "environment": env,
-            "detach": True,
-            "remove": False,  # we remove manually after reading logs
-            "extra_hosts": {"host.docker.internal": "host-gateway"},
-        }
+        while True:
+            # Snapshot under lock-free copy; events list only grows.
+            current = job.events
+            while idx < len(current):
+                yield current[idx]
+                idx += 1
 
-    async def _watch(self, job_id: str) -> None:
-        """Wait for container exit, classify result, clean up.
+            if job.status in terminal and idx >= len(job.events):
+                return
 
-        A side-car coroutine flushes container stdout/stderr to
-        jobs/{id}/hermes.log every ~1.5s so the UI's debug pane and the
-        /logs endpoint can show progress while the job is running.
+            if job._cond is None:
+                await asyncio.sleep(0.2)
+                continue
+
+            async with job._cond:
+                # Wait up to 1s for a notify; periodic wake lets us re-check
+                # status in case the writer crashed before notifying.
+                try:
+                    await asyncio.wait_for(job._cond.wait(), timeout=1.0)
+                except asyncio.TimeoutError:
+                    pass
+
+    def read_logs(self, job_id: str) -> str | None:
+        """Back-compat: return a plain-text dump of events (one per line).
+
+        Old clients poll /logs and render with a regex parser; keep this
+        working during the rollover. New clients should use /events SSE.
         """
+        job = self._jobs.get(job_id)
+        if job is None:
+            return None
+        if not job.events:
+            return None
+        out: list[str] = []
+        for e in job.events:
+            out.append(f"[{e.ts}] {e.agent_id} {e.type}: {json.dumps(e.payload, ensure_ascii=False)[:400]}")
+        return "\n".join(out)
+
+    # ---------- internals ----------
+
+    async def _emit(self, job: Job, ev: Event) -> None:
+        job.events.append(ev)
+        # Persist to events.jsonl for post-mortem debugging.
+        if job.workspace_path:
+            try:
+                with (job.workspace_path / EVENTS_FILENAME).open("a", encoding="utf-8") as f:
+                    f.write(json.dumps(ev.to_dict(), ensure_ascii=False) + "\n")
+            except Exception:
+                logger.debug("failed to persist event", exc_info=True)
+        cond = job._cond
+        if cond is not None:
+            async with cond:
+                cond.notify_all()
+
+    async def _run(self, job_id: str, query: str) -> None:
         job = self._jobs[job_id]
-        container = self._containers.get(job_id)
-        if container is None:
-            job.status = JobStatus.failed
-            job.error = "Container reference lost"
+        await self._emit(job, Event.now(
+            job_id=job_id, agent_id="lead", type="spawn",
+            payload={"query": query, "skills": self._skills,
+                     "hermes_bin": self._hermes_bin},
+        ))
+
+        # Lazy import — acp SDK lives inside the hermes venv.
+        try:
+            from acp import (
+                PROTOCOL_VERSION, Client, RequestError,
+                connect_to_agent, text_block,
+            )
+            from acp.schema import ClientCapabilities, Implementation
+        except Exception as e:
+            await self._fail(job, f"acp SDK import failed: {e}")
             return
 
-        async def _tail_logs() -> None:
-            """Periodically snapshot container logs into hermes.log.
+        proc_env = {
+            **os.environ,
+            **self._env,
+            "SEARCHARVESTER_URL": self._adapter_url,
+            "HERMES_HOME": self._hermes_home,
+        }
 
-            docker-py's container.logs() returns everything produced so far,
-            so each call gives a fresh full snapshot. Cheap for our log sizes.
-            """
-            while True:
-                try:
-                    logs_bytes = await asyncio.to_thread(container.logs)
-                    self._persist_log(job, logs_bytes)
-                except Exception:
-                    # Container may have been removed already; swallow and retry
-                    # next tick until cancellation.
-                    pass
-                await asyncio.sleep(1.5)
+        # Subprocess
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self._hermes_bin, "acp",
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(job.workspace_path),
+                env=proc_env,
+            )
+        except FileNotFoundError:
+            await self._fail(job, f"`{self._hermes_bin}` not found in PATH")
+            return
+        except Exception as e:
+            await self._fail(job, f"failed to spawn hermes acp: {e}")
+            return
 
-        tailer = asyncio.create_task(_tail_logs())
+        job._process = proc
+        job.status = JobStatus.running
+
+        # Drain stderr to hermes.log so we can debug any crashes
+        stderr_task = asyncio.create_task(self._drain_stderr(job, proc))
+
+        # Build ACP client wiring up our normalizer
+        orch = self
+
+        class _Forwarder(Client):
+            async def session_update(
+                self,
+                session_id: str,
+                update: Any,
+                **_: Any,
+            ) -> None:
+                ev = normalize_acp_update(
+                    update, job_id=job_id, agent_id="lead", parent_id=None,
+                )
+                if ev is not None:
+                    await orch._emit(job, ev)
+
+            async def request_permission(self, *a, **k):
+                raise RequestError.method_not_found("session/request_permission")
+            async def write_text_file(self, *a, **k):
+                raise RequestError.method_not_found("fs/write_text_file")
+            async def read_text_file(self, *a, **k):
+                raise RequestError.method_not_found("fs/read_text_file")
+            async def create_terminal(self, *a, **k):
+                raise RequestError.method_not_found("terminal/create")
+            async def terminal_output(self, *a, **k):
+                raise RequestError.method_not_found("terminal/output")
+            async def release_terminal(self, *a, **k):
+                raise RequestError.method_not_found("terminal/release")
+            async def wait_for_terminal_exit(self, *a, **k):
+                raise RequestError.method_not_found("terminal/wait_for_exit")
+            async def kill_terminal(self, *a, **k):
+                raise RequestError.method_not_found("terminal/kill")
+            async def ext_method(self, method, params):
+                raise RequestError.method_not_found(method)
+            async def ext_notification(self, method, params):
+                raise RequestError.method_not_found(method)
+
+        client = _Forwarder()
+        conn = connect_to_agent(client, proc.stdin, proc.stdout)
 
         try:
-            await asyncio.wait_for(
-                asyncio.to_thread(container.wait),
-                timeout=self._timeout,
+            await conn.initialize(
+                protocol_version=PROTOCOL_VERSION,
+                client_capabilities=ClientCapabilities(),
+                client_info=Implementation(
+                    name="searcharvester",
+                    title="Searcharvester Orchestrator",
+                    version="2.2.0",
+                ),
             )
-            # Final read (guaranteed to include the REPORT_SAVED marker line).
-            logs_bytes = await asyncio.to_thread(container.logs)
-            self._classify_success(job, logs_bytes)
-        except asyncio.TimeoutError:
-            job.status = JobStatus.timeout
-            job.error = f"Exceeded timeout of {self._timeout}s"
+            session = await conn.new_session(mcp_servers=[], cwd=str(job.workspace_path))
+
+            # Preload skills via slash-command prompt prefix — `hermes acp` honours
+            # the same `--skills` contract through the /skills slash command.
+            # Simpler: shove skills load into the query text itself (agent reads
+            # SKILL.md when it sees the name). That matches chat-mode behaviour.
+            skills_hint = ", ".join(self._skills)
+            wrapped = (
+                f"Use these skills: {skills_hint}.\n\n"
+                f"{query}"
+                f"{MANDATORY_SUFFIX}"
+            )
+
+            prompt_task = asyncio.create_task(
+                conn.prompt(
+                    session_id=session.session_id,
+                    prompt=[text_block(wrapped)],
+                )
+            )
+
             try:
-                await asyncio.to_thread(container.kill)
-            except Exception:
-                logger.exception("Failed to kill timed-out container %s", job_id)
-            try:
-                logs_bytes = await asyncio.to_thread(container.logs)
-                self._persist_log(job, logs_bytes)
-            except Exception:
-                pass
+                await asyncio.wait_for(prompt_task, timeout=self._timeout)
+            except asyncio.TimeoutError:
+                prompt_task.cancel()
+                job.status = JobStatus.timeout
+                job.error = f"exceeded timeout of {self._timeout}s"
+                await self._emit(job, Event.now(
+                    job_id=job_id, agent_id="lead", type="done",
+                    payload={"status": "timeout", "error": job.error},
+                ))
+                return
+
+            # Prompt returned — agent finished. Collect artifacts.
+            await self._finalize_success(job)
+
         except Exception as e:
-            job.status = JobStatus.failed
-            job.error = f"Watch error: {e}"
-            logger.exception("Watch error for %s", job_id)
+            logger.exception("ACP session crashed for %s", job_id)
+            await self._fail(job, f"ACP session error: {e}")
         finally:
-            tailer.cancel()
+            # Tidy subprocess if still alive.
+            if proc.returncode is None:
+                try:
+                    proc.terminate()
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=3)
+                    except asyncio.TimeoutError:
+                        proc.kill()
+                except Exception:
+                    pass
+            stderr_task.cancel()
             try:
-                await tailer
+                await stderr_task
             except (asyncio.CancelledError, Exception):
                 pass
-            try:
-                await asyncio.to_thread(container.remove, force=True)
-            except Exception:
-                logger.debug("Container remove failed (maybe already gone)")
             job.finished_at = datetime.now(timezone.utc)
             if job.started_at:
                 job.duration_sec = (job.finished_at - job.started_at).total_seconds()
-            self._containers.pop(job_id, None)
 
-    def _classify_success(self, job: Job, logs_bytes: bytes) -> None:
-        """Decide completed/failed based on logs + report.md existence.
-
-        Classification policy (lenient):
-        - Happy path: marker present AND report.md on disk → `completed`.
-        - Marker without file: treat stdout as the report → `completed` with
-          an advisory `error` note.
-        - No marker but agent produced a substantive response (e.g. refusal,
-          direct answer for a trivial query): use the cleaned stdout as the
-          report → `completed` with advisory note.
-        - Nothing meaningful produced: `failed` with helpful message.
-        """
-        self._persist_log(job, logs_bytes)
-        logs = logs_bytes.decode("utf-8", errors="replace")
-        has_marker = REPORT_MARKER in logs
-        report_path = (job.workspace_path or Path()) / REPORT_FILENAME
-        report_exists = report_path.exists()
-
-        if has_marker and report_exists:
-            job.status = JobStatus.completed
-            job.report = report_path.read_text(encoding="utf-8", errors="replace")
+    async def _drain_stderr(self, job: Job, proc: Any) -> None:
+        """Append hermes stderr to hermes.log for debug."""
+        if proc.stderr is None:
             return
-
-        stdout_response = self._extract_agent_response(logs)
-
-        if has_marker and not report_exists:
-            if stdout_response:
-                job.status = JobStatus.completed
-                job.report = stdout_response
-                job.error = f"{REPORT_MARKER} printed but report.md missing — using stdout"
-            else:
-                job.status = JobStatus.failed
-                job.error = f"{REPORT_MARKER} printed but no report content"
-            return
-
-        # No marker: the agent skipped the mandatory contract. Accept if stdout
-        # has a real response (refusal, short answer, etc.).
-        if stdout_response and len(stdout_response) >= 30:
-            job.status = JobStatus.completed
-            job.report = stdout_response
-            job.error = "agent did not save report.md — using stdout response"
-        else:
-            job.status = JobStatus.failed
-            job.error = (
-                f"no {REPORT_MARKER} marker and no substantive response in logs"
-            )
-
-    @staticmethod
-    def _extract_agent_response(logs: str) -> str:
-        """Strip Hermes boilerplate from stdout, keep only the agent's reply.
-
-        Hermes (without --quiet) echoes the user's query along with the
-        orchestrator-appended MANDATORY_SUFFIX, then tool previews, then the
-        final response in a box, then an exit summary. We:
-          1. Drop per-line banners / preview / summary lines.
-          2. Drop the whole "mandatory-suffix echo" block that starts at
-             "IMPORTANT — Role + output contract" and ends at the separator
-             line before the agent actually starts talking.
-        """
-        drop_patterns = (
-            "Syncing bundled skills",
-            "skills_sync.py",
-            "Token cost", "Tokens:", "Cost:", "cost/tokens",
-            "Hermes Agent v",                        # banner
-            "Query:",                                # echoed user query
-            "Initializing agent",
-            "Enabled toolsets",
-            "Loaded skills",
-            "Tool call",                             # "Tool call: searcharvester-search ..."
-            "Running tool",
-            "tool:",                                 # "tool: bash ..."
-            "preparing exec",
-            "preparing terminal",
-            "preparing searcharvester",
-        )
-        drop_prefixes = (
-            "Done:",                 # "Done: 0 new, 0 updated, 72 unchanged ..."
-            "session_id:",
-            "Resume this session with",
-            "Session:", "Duration:", "Messages:",
-            "⚠",                    # various warnings Hermes emits
-            "─",                    # box-drawing characters used around the answer
-            "│",
-            "╭", "╰", "╯", "╮",
-            "+",                    # some box variants use ASCII +
-            "━", "┃", "┏", "┓", "┗", "┛",
-            "  ┊",                  # Hermes tool-preview indent marker
-        )
-
-        kept: list[str] = []
-        # Stateful skip for the MANDATORY_SUFFIX block — once we see its
-        # sentinel, skip every line up to and including the "Both steps are
-        # non-negotiable." footer.
-        skipping_suffix = False
-        for line in logs.splitlines():
-            stripped = line.strip()
-
-            if not skipping_suffix and (
-                "IMPORTANT — Role + output contract" in line
-                or "IMPORTANT — Output contract" in line
-            ):
-                skipping_suffix = True
-                continue
-            if skipping_suffix:
-                if "non-negotiable" in stripped:
-                    skipping_suffix = False
-                continue
-
-            if any(p in line for p in drop_patterns):
-                continue
-            if any(stripped.startswith(p) for p in drop_prefixes):
-                continue
-            kept.append(line)
-
-        text = "\n".join(kept).strip()
-        # Collapse >2 blank lines in a row
-        while "\n\n\n" in text:
-            text = text.replace("\n\n\n", "\n\n")
-        return text
-
-    def _persist_log(self, job: Job, logs_bytes: bytes) -> None:
-        """Write container stdout/stderr to jobs/{id}/hermes.log."""
         if job.workspace_path is None:
             return
+        log_path = job.workspace_path / LOG_FILENAME
         try:
-            (job.workspace_path / LOG_FILENAME).write_bytes(logs_bytes)
+            with log_path.open("ab") as f:
+                while True:
+                    chunk = await proc.stderr.read(4096)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    f.flush()
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            logger.exception("Failed to persist log for %s", job.id)
+            logger.debug("stderr drain error", exc_info=True)
+
+    async def _finalize_success(self, job: Job) -> None:
+        report_path = (job.workspace_path or Path()) / REPORT_FILENAME
+        if report_path.exists():
+            job.report = report_path.read_text(encoding="utf-8", errors="replace")
+            job.status = JobStatus.completed
+            await self._emit(job, Event.now(
+                job_id=job.id, agent_id="lead", type="done",
+                payload={"status": "completed", "report_bytes": len(job.report)},
+            ))
+            return
+
+        # No report.md — fall back on the last `message` events as report text
+        msg_chunks = [
+            e.payload.get("text", "") for e in job.events
+            if e.type == "message" and isinstance(e.payload.get("text"), str)
+        ]
+        fallback = "".join(msg_chunks).strip()
+        if fallback:
+            job.report = fallback
+            job.status = JobStatus.completed
+            job.error = "no report.md — using assistant message"
+            await self._emit(job, Event.now(
+                job_id=job.id, agent_id="lead", type="done",
+                payload={"status": "completed", "note": job.error},
+            ))
+            return
+
+        job.status = JobStatus.failed
+        job.error = "agent finished without report.md or any message"
+        await self._emit(job, Event.now(
+            job_id=job.id, agent_id="lead", type="done",
+            payload={"status": "failed", "error": job.error},
+        ))
+
+    async def _fail(self, job: Job, error: str) -> None:
+        job.status = JobStatus.failed
+        job.error = error
+        job.finished_at = datetime.now(timezone.utc)
+        if job.started_at:
+            job.duration_sec = (job.finished_at - job.started_at).total_seconds()
+        await self._emit(job, Event.now(
+            job_id=job.id, agent_id="lead", type="done",
+            payload={"status": "failed", "error": error},
+        ))

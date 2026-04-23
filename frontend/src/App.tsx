@@ -6,8 +6,9 @@ import ReportView from "./components/ReportView";
 import DebugDrawer from "./components/DebugDrawer";
 import {
   API_URL,
-  EventPayload,
+  AgentEvent,
   JobStatus,
+  JobTerminalStatus,
   SSESubscription,
   cancelJob,
   checkHealth,
@@ -46,7 +47,6 @@ function useHashJob(): [
 ] {
   const [job, setJob] = useState<ActiveJob | null>(null);
 
-  // read once
   useEffect(() => {
     const parseHash = () => {
       const raw = window.location.hash.replace(/^#/, "");
@@ -77,20 +77,24 @@ function useHashJob(): [
 export default function App() {
   const healthy = useHealth();
   const [job, setJob] = useHashJob();
-  const [latest, setLatest] = useState<EventPayload | null>(null);
-  const [finalStatus, setFinalStatus] = useState<JobStatus | null>(null);
+  const [events, setEvents] = useState<AgentEvent[]>([]);
+  const [finalStatus, setFinalStatus] = useState<JobTerminalStatus | null>(null);
+  const [report, setReport] = useState<string | null>(null);
+  const [jobSnapshot, setJobSnapshot] = useState<{
+    status: JobStatus;
+    error: string | null;
+    duration_sec: number | null;
+  } | null>(null);
   const subRef = useRef<SSESubscription | null>(null);
 
-  // (Re-)subscribe when the active job changes (includes page-reload restore).
-  // IMPORTANT: before opening the SSE stream we check the job actually exists
-  // on the server. The orchestrator's _jobs dict is in-memory, so after an
-  // adapter restart all previous job_ids are gone and the SSE would just fail
-  // silently while the debug poller spams 404s. We clear the hash instead.
+  // (Re-)subscribe when the active job changes (includes hash restore).
   useEffect(() => {
     subRef.current?.close();
     subRef.current = null;
-    setLatest(null);
+    setEvents([]);
     setFinalStatus(null);
+    setReport(null);
+    setJobSnapshot(null);
 
     if (!job) return;
 
@@ -99,43 +103,57 @@ export default function App() {
       const snapshot = await getJob(job.jobId).catch(() => null);
       if (aborted) return;
       if (snapshot === null) {
-        // Job unknown to the server — drop from URL.
+        // Job unknown to the server — drop from URL (adapter likely restarted).
         setJob(null);
         return;
       }
 
-      // If the job already finished while we were away (e.g. page reload after
-      // completion), fill state from the snapshot and skip SSE.
+      setJobSnapshot({
+        status: snapshot.status,
+        error: snapshot.error,
+        duration_sec: snapshot.duration_sec,
+      });
+      setReport(snapshot.report);
+
       const terminal = ["completed", "failed", "timeout", "cancelled"];
       if (terminal.includes(snapshot.status)) {
-        setLatest({
+        setFinalStatus({
+          job_id: snapshot.job_id,
           status: snapshot.status,
-          phase: snapshot.status,
-          elapsed_sec: snapshot.duration_sec ?? null,
-          artifacts: {},
           duration_sec: snapshot.duration_sec,
-          report: snapshot.report,
+          has_report: snapshot.report !== null,
           error: snapshot.error,
         });
-        setFinalStatus(snapshot.status);
         return;
       }
 
-      // Live job — open SSE.
       const sub = subscribeToJob(
         job.jobId,
-        (kind, payload) => {
-          setLatest(payload);
-          if (kind !== "status") {
-            setFinalStatus(payload.status);
+        (ev) => {
+          setEvents((prev) => [...prev, ev]);
+          // If the `done` event carried a successful status, reflect it;
+          // we'll also get the final JobTerminalStatus next, but this
+          // makes the UI snappier.
+          if (ev.type === "done") {
+            const status = (ev.payload.status as JobStatus | undefined) ?? null;
+            if (status) {
+              setJobSnapshot((s) =>
+                s ? { ...s, status } : { status, error: null, duration_sec: null }
+              );
+            }
+          }
+        },
+        async (final) => {
+          setFinalStatus(final);
+          // Fetch the final report text (events carry only previews).
+          if (final.has_report) {
+            const snap = await getJob(job.jobId).catch(() => null);
+            if (snap?.report) setReport(snap.report);
           }
         },
         async () => {
-          // SSE errored — double-check whether the job is still there.
           const check = await getJob(job.jobId).catch(() => null);
-          if (check === null) {
-            setJob(null);
-          }
+          if (check === null) setJob(null);
         }
       );
       subRef.current = sub;
@@ -166,7 +184,6 @@ export default function App() {
   const onRunAgain = () => setJob(null);
 
   const isRunning = job !== null && finalStatus === null;
-  const report = latest?.report ?? null;
 
   return (
     <div className="min-h-full pb-24">
@@ -215,8 +232,9 @@ export default function App() {
           <JobStatusCard
             query={job.query}
             jobId={job.jobId}
-            latest={latest}
+            events={events}
             finalStatus={finalStatus}
+            jobSnapshot={jobSnapshot}
             onCancel={onCancel}
           />
         )}
@@ -235,7 +253,11 @@ export default function App() {
         )}
       </main>
 
-      <DebugDrawer jobId={job?.jobId ?? null} isRunning={isRunning} />
+      <DebugDrawer
+        jobId={job?.jobId ?? null}
+        events={events}
+        isRunning={isRunning}
+      />
     </div>
   );
 }
