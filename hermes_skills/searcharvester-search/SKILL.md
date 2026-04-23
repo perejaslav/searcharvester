@@ -27,7 +27,7 @@ Do **not** use this skill for:
 
 ## Procedure
 
-The search endpoint lives at `$SEARCHARVESTER_URL` (default `http://tavily-adapter:8000`). It is reachable via the helper script in this skill.
+The search endpoint lives at `$SEARCHARVESTER_URL` (default `http://127.0.0.1:8000`). It is reachable via the helper script in this skill.
 
 ### Basic search
 

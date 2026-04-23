@@ -27,7 +27,7 @@ Do **not** use this skill for:
 
 ## Procedure
 
-The extract endpoint lives at `$SEARCHARVESTER_URL` (default `http://tavily-adapter:8000`). Use the helper script.
+The extract endpoint lives at `$SEARCHARVESTER_URL` (default `http://127.0.0.1:8000`). Use the helper script.
 
 ### Size presets
 
