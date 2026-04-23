@@ -134,11 +134,21 @@ PARENT USER QUERY (for context only):
 TOOLS: You only have the `terminal` toolset. Call the searcharvester
 scripts as shell commands — they are not registered as tools:
 
+  # Search — returns JSON of URLs + snippets
   python3 /opt/data/skills/searcharvester-search/scripts/search.py \
     --query "<query>" --max-results 5
 
+  # Extract — saves FULL markdown to ./extracts/<id>.md and returns a
+  # pointer (id, url, total_chars, path, 800-char preview).
+  # There is no --size any more; every extract is saved in full so
+  # you can read specific sections with shell tools.
   python3 /opt/data/skills/searcharvester-extract/scripts/extract.py \
-    --url "<url>" --size m
+    --url "<url>"
+
+  # Then read the saved file precisely — no truncation:
+  grep -ni 'keyword' ./extracts/<id>.md
+  head -200 ./extracts/<id>.md
+  sed -n '300,600p' ./extracts/<id>.md
 
 HARD RULE: Your FIRST action must be a `terminal` call with search.py.
 Never answer from your training memory — your data is older than today.
@@ -146,8 +156,14 @@ Never answer from your training memory — your data is older than today.
 METHOD:
 1. Run 2–4 search.py invocations with varied phrasings.
 2. Pick 4–6 authoritative URLs from the combined results.
-3. Run extract.py on each. If HTTP 422/502/500, try another URL.
-4. Target: 4–6 successful extracts.
+3. Run extract.py on each — this saves the FULL page to
+   `./extracts/<id>.md`. If HTTP 422/502/500, try another URL.
+4. Use `grep -ni` / `head` / `sed` on the saved files to find the
+   specific quote you want to cite. The preview in extract.py's
+   output is only 800 chars — the file has the rest.
+5. Target: 4–6 successful extracts, each actually read (not just
+   fetched — if you never grep or head it, you don't know what's
+   really in there).
 
 RETURN FORMAT (markdown only, no preamble):
 ### Findings
@@ -178,7 +194,8 @@ USER QUERY:
 "<USER_QUERY>"
 
 TOOLS: Same as researcher — terminal + searcharvester-search/extract
-scripts.
+scripts (extract saves to `./extracts/<id>.md`; use grep/head to read
+specific sections).
 
 HARD RULE: Your FIRST action is a search.py call with one of these
 phrasings (pick what fits):
@@ -228,11 +245,14 @@ USER QUERY:
 FACTS TO VERIFY (from the lead's plan):
 <FACTS>
 
-TOOLS: Same as researcher.
+TOOLS: Same as researcher (extract saves to `./extracts/<id>.md`; use
+`grep -ni '<fact>'` to locate the exact mention).
 
 HARD RULE: For each fact, run ≥2 searches from DIFFERENT angles, and
 extract from ≥2 DIFFERENT DOMAINS. A single-domain confirmation is not
-confirmation — big sites reprint each other's errors.
+confirmation — big sites reprint each other's errors. After extract,
+`grep` the saved file for the specific number/date/name — don't trust
+preview snippets.
 
 METHOD:
 1. For each fact in the list, run 2 search.py calls with different
